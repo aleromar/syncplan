@@ -1,0 +1,38 @@
+[project]
+name = "syncplan"
+version = "0.1.0"
+description = "Back up folders to a backup drive from a plan you review before anything is copied, overwritten or deleted."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "aleromar", email = "31066313+aleromar@users.noreply.github.com" }
+]
+requires-python = ">=3.14"
+dependencies = []
+
+[project.scripts]
+syncplan = "syncplan.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.23,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "hypothesis>=6.168.5",
+    "pytest>=9.1.1",
+    "ruff>=0.16.10",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers", "--strict-config"]
+xfail_strict = true
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+# PTH flags os.path and open() on str paths, which enforces the pathlib principle.
+select = ["E", "W", "F", "I", "B", "UP", "SIM", "PTH", "RUF"]
