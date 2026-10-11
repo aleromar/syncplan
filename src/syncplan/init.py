@@ -5,9 +5,12 @@ Everything is read and checked first, and the marker is the only thing written (
 
 import os
 from collections.abc import Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
+from shutil import disk_usage
 
+from syncplan import space
 from syncplan.marker import (
     MARKER_DIR,
     Marker,
@@ -18,6 +21,7 @@ from syncplan.marker import (
     read_marker,
     write_marker,
 )
+from syncplan.space import format_size
 
 _FORBIDDEN = frozenset('\\/:*?"<>|')
 
@@ -97,7 +101,8 @@ def check_name(name: str) -> None:
 
 
 def finish_init(setup: Setup) -> list[str]:
-    """Steps 5-7: write the marker and return the report lines."""
+    """Steps 5-7: measure, write the marker, and return the report lines."""
+    sizes, space_lines = _measure(setup) if setup.sources else ([], [])
     try:
         write_marker(setup.backup, setup.sources)
     except FileExistsError:
@@ -111,7 +116,11 @@ def finish_init(setup: Setup) -> list[str]:
         raise Refusal(
             f"Couldn't write the marker in {setup.backup / MARKER_DIR}: {reason}."
         ) from error
-    return [f"Initialized syncplan backup at {setup.backup}", *source_lines(setup.sources)]
+    return [
+        f"Initialized syncplan backup at {setup.backup}",
+        *source_lines(setup.sources, [format_size(size) for size in sizes]),
+        *space_lines,
+    ]
 
 
 def source_lines(sources: Sequence[Source], sizes: Sequence[str] = ()) -> list[str]:
@@ -128,6 +137,44 @@ def source_lines(sources: Sequence[Source], sizes: Sequence[str] = ()) -> list[s
             line = f"{line:<{name_width + path_width + 6}}  {sizes[index]:>{size_width}}"
         lines.append(line)
     return lines
+
+
+def _measure(setup: Setup) -> tuple[list[int], list[str]]:
+    """R2.5-R2.8: the space each source needs, and a warning if the drive looks short."""
+    block = space.block_size(setup.backup)
+    sizes, skipped = [], 0
+    for source in setup.sources:
+        size, missed = space.folder_size(source.path, block)
+        sizes.append(size)
+        skipped += missed
+    needed = sum(sizes)
+    capacity, _, free = disk_usage(setup.backup)
+    drive = setup.backup.anchor
+    line = f"Space needed: about {format_size(needed)}. {drive} has {format_size(free)} free."
+    if skipped == 1:
+        line += " (1 folder couldn't be read and isn't counted)"
+    elif skipped:
+        line += f" ({skipped} folders couldn't be read and aren't counted)"
+    lines = [line]
+    if needed > free:
+        lines.append(
+            f"Warning: about {format_size(needed - free)} short."
+            " The first apply will stop before copying unless you free space."
+        )
+        for folder in setup.adopted:
+            with suppress(OSError):
+                copy = format_size(space.folder_size(folder, block)[0])
+                lines.append(
+                    f"An existing copy in {folder} ({copy}) may cover part of this;"
+                    " the first plan gives the exact figure."
+                )
+    elif (left := free - needed) * 10 < capacity:
+        lines.append(
+            f"Note: after the first backup only {format_size(left)} ({left * 100 // capacity}%)"
+            f" of {drive} would be free. Overwritten and deleted files are kept in quarantine"
+            " on this drive, so it may fill up."
+        )
+    return sizes, lines
 
 
 def _check_backup(root: Path) -> None:

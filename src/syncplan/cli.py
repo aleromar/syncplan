@@ -37,6 +37,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     try:
         setup = init.check_init(args.backup, args.sources)
+        if setup.sources:
+            print("Measuring sources...", flush=True)  # a slow USB drive shouldn't look stuck
         print("\n".join(init.finish_init(setup)))
     except init.Refusal as refusal:
         print(refusal, file=sys.stderr)
