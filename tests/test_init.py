@@ -2,12 +2,16 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
+import pytest
 from conftest import make_tree
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from syncplan import marker
-from syncplan.init import read_argument
+from syncplan.init import Refusal, check_name, read_argument, subfolder_name
 from syncplan.marker import Source, read_marker
 
 
@@ -295,6 +299,247 @@ def test_r2_2_folder_own_marker_is_reported_before_one_above_it(tmp_path, run_cl
 
     assert code == 1
     assert "is already a syncplan backup" in err
+
+
+# R3 Check the sources, and NFR1
+
+
+def refused_and_nothing_written(result, backup: Path, *expected: str) -> bool:
+    code, _, err = result
+    assert code == 1, err
+    for text in expected:
+        assert text in err
+    return not (backup / ".syncplan").exists()
+
+
+def test_r3_1_missing_source_is_refused(tmp_path, run_cli):
+    backup, photos, _ = setup_folders(tmp_path)
+    camera = tmp_path / "Camera"
+
+    result = run_cli("init", backup, photos, camera)
+
+    assert refused_and_nothing_written(result, backup, f"{camera} does not exist")
+
+
+def test_r3_1_source_that_is_a_file_is_refused(tmp_path, run_cli):
+    backup, photos, _ = setup_folders(tmp_path)
+
+    result = run_cli("init", backup, photos / "a.jpg")
+
+    assert refused_and_nothing_written(result, backup, "is not a folder")
+
+
+def test_r3_2_backup_inside_a_source_is_refused(tmp_path, run_cli):
+    home = make_tree(tmp_path, {"me/Backup": None, "me/Photos/a.jpg": "a"}) / "me"
+
+    result = run_cli("init", home / "Backup", home)
+
+    assert refused_and_nothing_written(
+        result, home / "Backup", f"The backup {home / 'Backup'} is inside the source {home}"
+    )
+
+
+def test_r3_2_source_inside_the_backup_is_refused(tmp_path, run_cli):
+    backup, _, _ = setup_folders(tmp_path)
+    inner = make_tree(backup, {"Photos/a.jpg": "a"}) / "Photos"
+
+    result = run_cli("init", backup, inner)
+
+    assert refused_and_nothing_written(result, backup, "is inside the backup")
+
+
+def test_r3_2_source_that_is_the_backup_is_refused(tmp_path, run_cli):
+    backup, _, _ = setup_folders(tmp_path)
+
+    result = run_cli("init", backup, backup)
+
+    assert refused_and_nothing_written(result, backup, "is both the backup and a source")
+
+
+def test_r3_2_relative_backup_inside_a_source_is_refused(tmp_path, run_cli, monkeypatch):
+    home = make_tree(tmp_path, {"me/Backup": None}) / "me"
+    monkeypatch.chdir(home)
+
+    result = run_cli("init", "Backup", home)
+
+    assert refused_and_nothing_written(result, home / "Backup", "is inside the source")
+
+
+def test_r3_2_junction_cannot_hide_a_backup_inside_a_source(tmp_path, run_cli, junction):
+    home = make_tree(tmp_path, {"me/Backup": None}) / "me"
+    link = junction(tmp_path / "Bk", home / "Backup")
+
+    result = run_cli("init", link, home)
+
+    assert refused_and_nothing_written(result, home / "Backup", "is inside the source")
+
+
+def test_r3_3_the_same_source_twice_is_refused(tmp_path, run_cli):
+    backup, photos, _ = setup_folders(tmp_path)
+
+    result = run_cli("init", backup, photos, f"Again={photos}")
+
+    assert refused_and_nothing_written(result, backup, "is given twice")
+
+
+def test_r3_3_source_inside_another_source_is_refused(tmp_path, run_cli):
+    backup, photos, _ = setup_folders(tmp_path)
+    src = photos.parent
+
+    result = run_cli("init", backup, src, photos)
+
+    assert refused_and_nothing_written(
+        result, backup, f"{photos.resolve()} is inside another source, {src.resolve()}"
+    )
+
+
+def test_r3_4_two_sources_with_the_same_name_are_refused(tmp_path, run_cli):
+    make_tree(tmp_path, {"a/Documents/x": "x", "b/Documents/y": "y", "backup": None})
+    backup = tmp_path / "backup"
+
+    result = run_cli("init", backup, tmp_path / "a" / "Documents", tmp_path / "b" / "Documents")
+
+    assert refused_and_nothing_written(
+        result, backup, 'same subfolder name "Documents"', "=", str(tmp_path / "b" / "Documents")
+    )
+    code, _, _ = run_cli(
+        "init", backup, tmp_path / "a" / "Documents", f"WorkDocs={tmp_path / 'b' / 'Documents'}"
+    )
+    assert code == 0
+
+
+def test_r3_4_drive_root_without_a_name_is_refused():
+    with pytest.raises(Refusal, match=r"NAME=SOURCE"):
+        subfolder_name(None, Path("F:\\"))
+    assert subfolder_name("Stick", Path("F:\\")) == "Stick"
+    assert subfolder_name(None, Path("C:\\Photos")) == "Photos"
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["", ".", "..", ".syncplan", ".SyncPlan", "CON", "con.txt", "NUL ", "a.", "a ", "a\tb",
+     "a*b", "a?b", 'a"b', "a<b", "a>b", "a|b", "x" * 256, "\U0001f600" * 128],
+)  # fmt: skip
+def test_r3_5_invalid_subfolder_names_are_refused(tmp_path, run_cli, name):
+    backup, photos, _ = setup_folders(tmp_path)
+
+    with pytest.raises(Refusal):
+        check_name(name)
+    result = run_cli("init", backup, f"{name}={photos}")
+    assert refused_and_nothing_written(result, backup)
+
+
+@pytest.mark.parametrize("name", ["Photos", "WorkDocs", "a b", "\u5199\u771f", "x" * 255, "a.b"])
+def test_r3_5_ordinary_names_are_accepted(name):
+    check_name(name)
+
+
+def test_r3_5_source_folder_named_syncplan_is_refused(tmp_path, run_cli):
+    backup, _, _ = setup_folders(tmp_path)
+    odd = make_tree(tmp_path, {"old/.syncplan/a.txt": "a"}) / "old" / ".syncplan"
+
+    result = run_cli("init", backup, odd)
+
+    assert refused_and_nothing_written(result, backup, "reserved for syncplan")
+
+
+@settings(max_examples=150, deadline=None)
+@given(st.text(max_size=64))
+def test_r3_5_every_accepted_name_can_be_created_exactly(name):
+    try:
+        check_name(name)
+    except Refusal:
+        assert (
+            name in ("", ".", "..")
+            or not set(name).isdisjoint('\\/:*?"<>|')
+            or (name.casefold() == ".syncplan" or os.path.isreserved(name))
+        )
+        return
+    with tempfile.TemporaryDirectory() as folder:
+        (Path(folder) / name).mkdir()
+        assert [p.name for p in Path(folder).iterdir()] == [name]
+
+
+def test_r3_6_a_backup_given_as_a_source_is_refused_with_its_real_sources(tmp_path, run_cli):
+    backup, photos, docs = setup_folders(tmp_path)
+    run_cli("init", backup, photos, docs)
+    second = make_tree(tmp_path, {"backup2": None}) / "backup2"
+
+    result = run_cli("init", second, backup)
+
+    assert refused_and_nothing_written(
+        result,
+        second,
+        f"{backup.resolve()} is a syncplan backup",
+        f"syncplan init {second.resolve()} {photos.resolve()} {docs.resolve()}",
+    )
+
+
+def test_r3_6_a_folder_inside_a_backup_is_refused(tmp_path, run_cli):
+    backup, photos, _ = setup_folders(tmp_path)
+    run_cli("init", backup, photos)
+    mirror = make_tree(backup, {"Photos/a.jpg": "a"}) / "Photos"
+    second = make_tree(tmp_path, {"backup2": None}) / "backup2"
+
+    result = run_cli("init", second, mirror)
+
+    assert refused_and_nothing_written(result, second, "is inside the syncplan backup")
+
+
+@pytest.mark.parametrize(
+    ("content", "reason"), [("damaged", "can't be read"), ('{"syncplan_marker": 99}', "upgrade")]
+)
+def test_r3_6_a_backup_with_an_unreadable_or_newer_marker_is_still_refused(
+    tmp_path, run_cli, content, reason
+):
+    backup, _, _ = setup_folders(tmp_path)
+    other = make_tree(tmp_path, {"other/.syncplan/marker.json": content}) / "other"
+
+    result = run_cli("init", backup, other)
+
+    assert refused_and_nothing_written(result, backup, "is a syncplan backup", reason)
+
+
+def test_r3_7_a_file_where_the_subfolder_would_be_is_refused(tmp_path, run_cli):
+    backup, photos, _ = setup_folders(tmp_path)
+    make_tree(backup, {"Photos": "not a folder"})
+
+    result = run_cli("init", backup, photos)
+
+    assert refused_and_nothing_written(result, backup, "not a folder", f"={photos.resolve()}")
+
+
+def test_r3_7_a_junction_where_the_subfolder_would_be_is_refused(tmp_path, run_cli, junction):
+    backup, photos, _ = setup_folders(tmp_path)
+    junction(backup / "Photos", photos)
+
+    result = run_cli("init", backup, photos)
+
+    assert refused_and_nothing_written(result, backup, "is a link")
+
+
+def test_nfr1_overlap_is_found_whatever_the_letter_case(tmp_path, run_cli):
+    home = make_tree(tmp_path, {"me/Backup": None}) / "me"
+
+    result = run_cli("init", home / "Backup", str(home).upper())
+
+    assert refused_and_nothing_written(result, home / "Backup", "is inside the source")
+
+
+def test_nfr1_the_same_source_in_another_case_is_a_duplicate(tmp_path, run_cli):
+    backup, photos, _ = setup_folders(tmp_path)
+
+    result = run_cli("init", backup, photos, f"Again={str(photos).lower()}")
+
+    assert refused_and_nothing_written(result, backup, "is given twice")
+
+
+def test_nfr1_names_differing_only_in_case_clash(tmp_path, run_cli):
+    backup, photos, docs = setup_folders(tmp_path)
+
+    result = run_cli("init", backup, photos, f"photos={docs}")
+
+    assert refused_and_nothing_written(result, backup, "same subfolder name")
 
 
 # Reading arguments (D2, D8)
