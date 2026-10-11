@@ -4,6 +4,7 @@ It says a folder is a syncplan backup and lists the source folders it holds.
 """
 
 import json
+import logging
 import os
 import tempfile
 from collections.abc import Sequence
@@ -12,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+logger = logging.getLogger(__name__)
 FORMAT = 1
 MARKER_DIR = ".syncplan"
 MARKER_NAME = "marker.json"
@@ -122,12 +124,18 @@ def write_marker(folder: Path, sources: Sequence[Source]) -> Marker:
         done = True
     finally:
         if not done:
+            removed = []
             with suppress(OSError):
                 if temp is not None:
                     temp.unlink()
+                    removed.append(temp.name)
             if created_dir:
                 with suppress(OSError):
                     own_dir.rmdir()
+                    removed.append(own_dir.name)
+            logger.debug(
+                "marker write failed; cleanup removed: %s", ", ".join(removed) or "nothing"
+            )
     return marker
 
 

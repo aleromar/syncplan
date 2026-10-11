@@ -1,9 +1,12 @@
 """How much space the sources need on the backup drive (R2.5-R2.8)."""
 
 import ctypes
+import logging
 import os
+import time
 from pathlib import Path
 
+logger = logging.getLogger(__name__)
 _kernel32 = ctypes.windll.kernel32
 _DEFAULT_BLOCK = 4096
 _UNITS = ("KB", "MB", "GB", "TB")
@@ -37,7 +40,8 @@ def folder_size(folder: Path, block: int) -> tuple[int, int]:
     Returns (bytes, subfolders that couldn't be listed). Links aren't followed, and a
     file that vanishes during the walk is ignored. An error on folder itself is raised.
     """
-    total = skipped = 0
+    total = skipped = files = 0
+    started = time.perf_counter()
     pending = [os.fspath(folder)]
     while pending:
         current = pending.pop()
@@ -54,11 +58,23 @@ def folder_size(folder: Path, block: int) -> tuple[int, int]:
                     except OSError:
                         continue
                     total += (size + block - 1) // block * block
-        except OSError:
+                    files += 1
+        except OSError as error:
             if current == os.fspath(folder):
                 raise
             folder.stat()  # still there? If the drive was unplugged, stop (§2 error table)
             skipped += 1
+            logger.debug("skipped %s: %s", current, error.strerror or error)
+    elapsed = time.perf_counter() - started
+    counted = f"{files:,} file" if files == 1 else f"{files:,} files"
+    logger.debug(
+        "measured %s: %s in %s, %d skipped, %.2f s",
+        folder,
+        format_size(total),
+        counted,
+        skipped,
+        elapsed,
+    )
     return total, skipped
 
 

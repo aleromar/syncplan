@@ -66,6 +66,18 @@ def full_disk(monkeypatch):
     monkeypatch.setattr(os, "fsync", fsync)
 
 
+@pytest.fixture(autouse=True)
+def program_data(tmp_path_factory, monkeypatch):
+    """Point syncplan's own folder at a temporary place: no test touches the real log or lock.
+
+    It is a separate temporary folder, never inside a test's own tree, so it can't overlap
+    the sources and backups tests create (R3.9, design D18).
+    """
+    folder = tmp_path_factory.mktemp("programdata")
+    monkeypatch.setenv("PROGRAMDATA", str(folder))
+    return folder
+
+
 @pytest.fixture
 def run_cli(capsys):
     """Run syncplan with the given arguments and return (exit code, stdout, stderr)."""

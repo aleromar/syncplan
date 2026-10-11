@@ -297,7 +297,7 @@ def test_r2_5_report_gives_each_size_the_total_and_free_space(tmp_path, run_cli,
     backup, photos, docs = two_sources(tmp_path)
     asked = drive(capacity=1000 * MB, free=900 * MB)
 
-    code, out, _ = run_cli("init", backup, photos, docs)
+    code, out, err = run_cli("init", backup, photos, docs)
 
     assert code == 0
     assert asked == [backup.resolve(), backup.resolve()]  # blocks and free space of the backup
@@ -306,8 +306,7 @@ def test_r2_5_report_gives_each_size_the_total_and_free_space(tmp_path, run_cli,
     assert any("Photos" in line and line.endswith("8.0 KB") for line in lines)
     assert any("Docs" in line and line.endswith("4.0 KB") for line in lines)
     assert f"Space needed: about 12 KB. {tmp_path.anchor} has 900 MB free." in lines
-    assert "Warning" not in out
-    assert "Note" not in out
+    assert err == ""  # no warning: plenty of room
 
 
 def test_r2_5_nothing_is_measured_without_sources(tmp_path, run_cli):
@@ -323,11 +322,11 @@ def test_r2_6_too_small_drive_warns_but_still_initializes(tmp_path, run_cli, dri
     backup, photos, docs = two_sources(tmp_path)
     drive(capacity=100 * MB, free=4 * KB)
 
-    code, out, _ = run_cli("init", backup, photos, docs)
+    code, _, err = run_cli("init", backup, photos, docs)
 
     assert code == 0
     assert (backup / ".syncplan" / "marker.json").exists()
-    assert "Warning: about 8.0 KB short." in out
+    assert "Warning: about 8.0 KB short." in err  # warnings go to the error output (R5.5)
 
 
 def test_r2_6_warning_names_an_old_copy_that_may_cover_part(tmp_path, run_cli, drive):
@@ -335,10 +334,10 @@ def test_r2_6_warning_names_an_old_copy_that_may_cover_part(tmp_path, run_cli, d
     make_tree(backup, {"Photos/old.jpg": b"x" * 100})
     drive(capacity=100 * MB, free=4 * KB)
 
-    _, out, _ = run_cli("init", backup, photos)
+    _, _, err = run_cli("init", backup, photos)
 
     old_copy = backup.resolve() / "Photos"
-    assert f"An existing copy in {old_copy} (4.0 KB) may cover part of this" in out
+    assert f"An existing copy in {old_copy} (4.0 KB) may cover part of this" in err
 
 
 def test_r2_6_an_old_copy_that_cannot_be_measured_is_still_named(
@@ -349,19 +348,19 @@ def test_r2_6_an_old_copy_that_cannot_be_measured_is_still_named(
     drive(capacity=100 * MB, free=4 * KB)
     failing_scandir(lambda path: path.parent.name == "backup", PermissionError(13, "denied"))
 
-    _, out, _ = run_cli("init", backup, photos)
+    _, _, err = run_cli("init", backup, photos)
 
     old_copy = backup.resolve() / "Photos"
-    assert f"An existing copy in {old_copy} (size unknown) may cover part of this" in out
+    assert f"An existing copy in {old_copy} (size unknown) may cover part of this" in err
 
 
 def test_r2_6_space_needed_exactly_equal_to_free_space_fits(tmp_path, run_cli, drive):
     backup, photos, docs = two_sources(tmp_path)
     drive(capacity=1000 * MB, free=12 * KB)
 
-    _, out, _ = run_cli("init", backup, photos, docs)
+    _, out, err = run_cli("init", backup, photos, docs)
 
-    assert "short" not in out
+    assert "short" not in out + err
 
 
 @pytest.mark.parametrize(
@@ -371,12 +370,12 @@ def test_r2_7_warns_only_below_10_percent_left(tmp_path, run_cli, drive, free, w
     backup, photos, docs = two_sources(tmp_path)
     drive(capacity=1000 * MB, free=free)
 
-    code, out, _ = run_cli("init", backup, photos, docs)
+    code, _, err = run_cli("init", backup, photos, docs)
 
     assert code == 0
-    assert ("kept in quarantine on this drive" in out) is warned
+    assert ("kept in quarantine on this drive" in err) is warned
     if warned:
-        assert "only 100 MB (9%)" in out
+        assert "only 100 MB (9%)" in err
 
 
 @pytest.mark.parametrize(
