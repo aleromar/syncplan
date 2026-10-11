@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
+from conftest import make_tree
 from hypothesis import example, given
 from hypothesis import strategies as st
 
@@ -28,10 +29,7 @@ VALID = {
 
 
 def put_marker(folder: Path, content: str | bytes) -> Path:
-    path = folder / ".syncplan" / "marker.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(content.encode() if isinstance(content, str) else content)
-    return path
+    return make_tree(folder, {".syncplan/marker.json": content}) / ".syncplan" / "marker.json"
 
 
 def test_r4_1_valid_marker_gives_creation_time_and_sources(tmp_path):
@@ -163,13 +161,13 @@ def test_r1_1_written_marker_reads_back_the_same_sources(pairs):
         assert (Path(folder) / ".syncplan" / "marker.json").read_bytes().isascii()
 
 
-def test_has_marker_is_false_without_marker_file(tmp_path):
+def test_r2_4_has_marker_is_false_without_marker_file(tmp_path):
     (tmp_path / ".syncplan").mkdir()
 
     assert not has_marker(tmp_path)
 
 
-def test_has_marker_raises_when_it_cannot_look(tmp_path, monkeypatch):
+def test_r2_4_has_marker_raises_when_it_cannot_look(tmp_path, monkeypatch):
     # A marker hidden by a permission error must not pass for "no marker" (R2.4, R3.6).
     real_stat = Path.stat
 
@@ -184,39 +182,27 @@ def test_has_marker_raises_when_it_cannot_look(tmp_path, monkeypatch):
         has_marker(tmp_path)
 
 
-def test_has_marker_is_true_whatever_the_marker_says(tmp_path):
+def test_r2_4_has_marker_is_true_whatever_the_marker_says(tmp_path):
     put_marker(tmp_path, "damaged")
 
     assert has_marker(tmp_path)
 
 
-def test_r1_6_failed_write_removes_the_syncplan_folder_it_created(tmp_path, monkeypatch):
-    def full_disk(fd):
-        raise OSError(28, "There is not enough space on the disk")
-
-    monkeypatch.setattr(marker.os, "fsync", full_disk)
-
+def test_r1_6_failed_write_removes_the_syncplan_folder_it_created(tmp_path, full_disk):
     with pytest.raises(OSError, match="not enough space"):
         write_marker(tmp_path, [Source("Photos", Path("C:\\Photos"))])
 
     assert list(tmp_path.iterdir()) == []
 
 
-def test_r1_6_failed_write_keeps_an_existing_syncplan_folder(tmp_path, monkeypatch):
-    make = tmp_path / ".syncplan" / "trash" / "kept.txt"
-    make.parent.mkdir(parents=True)
-    make.write_text("kept")
-
-    def full_disk(fd):
-        raise OSError(28, "There is not enough space on the disk")
-
-    monkeypatch.setattr(marker.os, "fsync", full_disk)
+def test_r1_6_failed_write_keeps_an_existing_syncplan_folder(tmp_path, full_disk):
+    kept = make_tree(tmp_path, {".syncplan/trash/kept.txt": "kept"}) / ".syncplan" / "trash"
 
     with pytest.raises(OSError):
         write_marker(tmp_path, [])
 
     assert sorted(p.name for p in (tmp_path / ".syncplan").iterdir()) == ["trash"]
-    assert make.read_text() == "kept"
+    assert (kept / "kept.txt").read_text() == "kept"
 
 
 def test_r1_6_failed_cleanup_still_reports_the_original_error(tmp_path, monkeypatch):

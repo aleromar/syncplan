@@ -132,14 +132,9 @@ def test_r1_5_existing_content_of_the_backup_is_left_unchanged(tmp_path, run_cli
 
 
 def test_r1_6_failed_write_exits_1_with_the_reason_and_leaves_no_marker(
-    tmp_path, run_cli, monkeypatch
+    tmp_path, run_cli, full_disk
 ):
     backup, photos, _ = setup_folders(tmp_path)
-
-    def full_disk(fd):
-        raise OSError(28, "There is not enough space on the disk")
-
-    monkeypatch.setattr(marker.os, "fsync", full_disk)
 
     code, _, err = run_cli("init", backup, photos)
 
@@ -234,17 +229,18 @@ def test_r2_3_unreadable_marker_is_refused_and_left_untouched(tmp_path, run_cli)
 
 def test_r2_3_marker_from_a_newer_syncplan_is_refused(tmp_path, run_cli):
     backup, photos, _ = setup_folders(tmp_path)
-    make_tree(backup, {".syncplan/marker.json": '{"syncplan_marker": 99}'})
+    newer = make_tree(backup, {".syncplan/marker.json": '{"syncplan_marker": 99}'})
 
     code, _, err = run_cli("init", backup, photos)
 
     assert code == 1
     assert "upgrade" in err
+    assert (newer / ".syncplan" / "marker.json").read_text() == '{"syncplan_marker": 99}'
 
 
 def test_r2_4_backup_inside_another_backup_is_refused(tmp_path, run_cli):
     backup, photos, _ = setup_folders(tmp_path)
-    run_cli("init", backup)
+    assert run_cli("init", backup)[0] == 0
     inner = make_tree(backup, {"Other": None}) / "Other"
 
     code, _, err = run_cli("init", inner, photos)
@@ -262,11 +258,12 @@ def test_r2_4_damaged_marker_above_still_counts_as_a_backup(tmp_path, run_cli):
 
     assert code == 1
     assert "is inside the syncplan backup" in err
+    assert not (backup / "Other" / ".syncplan").exists()
 
 
 def test_r2_4_relative_path_into_a_backup_is_refused(tmp_path, run_cli, monkeypatch):
     backup, photos, _ = setup_folders(tmp_path)
-    run_cli("init", backup)
+    assert run_cli("init", backup)[0] == 0
     make_tree(backup, {"Sub/Other": None})
     monkeypatch.chdir(backup / "Sub")
 
@@ -274,11 +271,12 @@ def test_r2_4_relative_path_into_a_backup_is_refused(tmp_path, run_cli, monkeypa
 
     assert code == 1
     assert "is inside the syncplan backup" in err
+    assert not (backup / "Sub" / "Other" / ".syncplan").exists()
 
 
 def test_r2_4_junction_into_a_backup_is_refused(tmp_path, run_cli, junction):
     backup, photos, _ = setup_folders(tmp_path)
-    run_cli("init", backup)
+    assert run_cli("init", backup)[0] == 0
     inner = make_tree(backup, {"Other": None}) / "Other"
     link = junction(tmp_path / "LooksSafe", inner)
 
@@ -286,6 +284,7 @@ def test_r2_4_junction_into_a_backup_is_refused(tmp_path, run_cli, junction):
 
     assert code == 1
     assert "is inside the syncplan backup" in err
+    assert not (inner / ".syncplan").exists()
 
 
 def test_r2_2_folder_own_marker_is_reported_before_one_above_it(tmp_path, run_cli):
@@ -293,13 +292,15 @@ def test_r2_2_folder_own_marker_is_reported_before_one_above_it(tmp_path, run_cl
     # leftovers alike, the folder's own marker decides the message.
     backup, photos, _ = setup_folders(tmp_path)
     make_tree(backup, {"Inner": None})
-    run_cli("init", backup / "Inner")
-    run_cli("init", backup)
+    assert run_cli("init", backup / "Inner")[0] == 0
+    assert run_cli("init", backup)[0] == 0
+    before = (backup / "Inner" / ".syncplan" / "marker.json").read_bytes()
 
     code, _, err = run_cli("init", backup / "Inner", photos)
 
     assert code == 1
     assert "is already a syncplan backup" in err
+    assert (backup / "Inner" / ".syncplan" / "marker.json").read_bytes() == before
 
 
 # R3 Check the sources, and NFR1

@@ -23,30 +23,30 @@ def rounded(size: int, block: int) -> int:
 # folder_size: the corner-case matrix (design §2)
 
 
-def test_empty_source_needs_nothing(tmp_path):
+def test_d5_empty_source_needs_nothing(tmp_path):
     assert folder_size(tmp_path, 4096) == (0, 0)
 
 
-def test_only_empty_folders_need_nothing(tmp_path):
+def test_d5_only_empty_folders_need_nothing(tmp_path):
     make_tree(tmp_path, {"a/b/c": None, "d": None})
 
     assert folder_size(tmp_path, 4096) == (0, 0)
 
 
-def test_zero_byte_files_need_nothing(tmp_path):
+def test_d5_zero_byte_files_need_nothing(tmp_path):
     make_tree(tmp_path, {f"empty{i}.txt": b"" for i in range(10)})
 
     assert folder_size(tmp_path, 4096) == (0, 0)
 
 
 @pytest.mark.parametrize(("size", "needed"), [(1, 4096), (4095, 4096), (4096, 4096), (4097, 8192)])
-def test_each_file_is_rounded_up_to_whole_blocks(tmp_path, size, needed):
+def test_d5_each_file_is_rounded_up_to_whole_blocks(tmp_path, size, needed):
     make_tree(tmp_path, {"f.bin": b"x" * size})
 
     assert folder_size(tmp_path, 4096) == (needed, 0)
 
 
-def test_many_small_files_on_big_blocks_need_a_block_each(tmp_path):
+def test_d5_many_small_files_on_big_blocks_need_a_block_each(tmp_path):
     make_tree(tmp_path, {f"s{i:04}.txt": b"x" for i in range(2000)})
 
     total, _ = folder_size(tmp_path, 128 * KB)
@@ -55,20 +55,20 @@ def test_many_small_files_on_big_blocks_need_a_block_each(tmp_path):
     assert format_size(total) == "250 MB"
 
 
-def test_deeply_nested_file_is_counted(tmp_path):
+def test_d5_deeply_nested_file_is_counted(tmp_path):
     deep = "/".join(["d"] * 30)
     make_tree(tmp_path, {f"{deep}/f.txt": b"x" * 10})
 
     assert folder_size(tmp_path, 4096) == (4096, 0)
 
 
-def test_wide_tree_is_counted_completely(tmp_path):
+def test_d5_wide_tree_is_counted_completely(tmp_path):
     make_tree(tmp_path, {f"dir{d:03}/f{f}.txt": b"x" * 10 for d in range(200) for f in range(5)})
 
     assert folder_size(tmp_path, 4096) == (1000 * 4096, 0)
 
 
-def test_large_files_are_counted_exactly(tmp_path, sparse_file):
+def test_d5_large_files_are_counted_exactly(tmp_path, sparse_file):
     sparse_file(tmp_path / "video.mkv", 5 * GB)
     sparse_file(tmp_path / "archive" / "disk.img", TB)
 
@@ -79,7 +79,7 @@ def test_large_files_are_counted_exactly(tmp_path, sparse_file):
     assert format_size(TB) == "1.0 TB"
 
 
-def test_mixed_tree_matches_an_independent_sum(tmp_path, sparse_file):
+def test_d5_mixed_tree_matches_an_independent_sum(tmp_path, sparse_file):
     sizes = {"a.txt": 0, "b/c.txt": 1, "b/d/e.bin": 4096, "b/d/f.bin": 4097, "g/h.bin": 70_000}
     make_tree(tmp_path, {path: b"x" * size for path, size in sizes.items()} | {"empty": None})
     sparse_file(tmp_path / "b" / "big.bin", 3 * GB + 1)
@@ -89,7 +89,7 @@ def test_mixed_tree_matches_an_independent_sum(tmp_path, sparse_file):
         assert folder_size(tmp_path, block) == (expected, 0)
 
 
-def test_hidden_system_and_read_only_files_are_counted(tmp_path):
+def test_d5_hidden_system_and_read_only_files_are_counted(tmp_path):
     files = [tmp_path / name for name in ("hidden.txt", "system.txt", "readonly.txt")]
     for file in files:
         file.write_bytes(b"x" * 100)
@@ -103,14 +103,14 @@ def test_hidden_system_and_read_only_files_are_counted(tmp_path):
             set_attributes(str(file), 0x80)
 
 
-def test_unusual_names_are_counted(tmp_path):
+def test_d5_unusual_names_are_counted(tmp_path):
     # 150 characters keeps the whole path under 260; longer paths are F8's (NG9).
     make_tree(tmp_path, {"a b.txt": "x", "写真.jpg": "x", "n" * 150: "x"})
 
     assert folder_size(tmp_path, 4096) == (3 * 4096, 0)
 
 
-def test_junction_inside_a_source_is_not_followed(tmp_path, junction, sparse_file):
+def test_d5_junction_inside_a_source_is_not_followed(tmp_path, junction, sparse_file):
     sparse_file(tmp_path / "elsewhere" / "big.bin", 5 * GB)
     source = make_tree(tmp_path, {"source/a.txt": "x"}) / "source"
     junction(source / "link", tmp_path / "elsewhere")
@@ -118,7 +118,7 @@ def test_junction_inside_a_source_is_not_followed(tmp_path, junction, sparse_fil
     assert folder_size(source, 4096) == (4096, 0)
 
 
-def test_file_symlink_inside_a_source_is_not_followed(tmp_path, sparse_file):
+def test_d5_file_symlink_inside_a_source_is_not_followed(tmp_path, sparse_file):
     target = sparse_file(tmp_path / "big.bin", 5 * GB)
     source = make_tree(tmp_path, {"source/a.txt": "x"}) / "source"
     try:
@@ -137,21 +137,14 @@ def test_file_symlink_inside_a_source_is_not_followed(tmp_path, sparse_file):
         OSError(0, "The filename or extension is too long", None, 206),
     ],
 )
-def test_r2_8_unreadable_subfolder_is_skipped_and_counted(tmp_path, monkeypatch, error):
+def test_r2_8_unreadable_subfolder_is_skipped_and_counted(tmp_path, failing_scandir, error):
     make_tree(tmp_path, {"ok/a.txt": "x", "locked/b.txt": "x"})
-    real_scandir = os.scandir
-
-    def scandir(path):
-        if Path(path).name == "locked":
-            raise error
-        return real_scandir(path)
-
-    monkeypatch.setattr(space.os, "scandir", scandir)
+    failing_scandir(lambda path: path.name == "locked", error)
 
     assert folder_size(tmp_path, 4096) == (4096, 1)
 
 
-def test_file_that_vanishes_during_the_walk_is_ignored(tmp_path, monkeypatch):
+def test_d5_file_that_vanishes_during_the_walk_is_ignored(tmp_path, monkeypatch):
     make_tree(tmp_path, {"stays.txt": "x", "goes.txt": "x"})
     real_scandir = os.scandir
 
@@ -182,7 +175,7 @@ def test_file_that_vanishes_during_the_walk_is_ignored(tmp_path, monkeypatch):
     assert folder_size(tmp_path, 4096) == (4096, 0)
 
 
-def test_source_root_that_fails_is_an_error(tmp_path):
+def test_r2_5_source_root_that_fails_is_an_error(tmp_path):
     with pytest.raises(FileNotFoundError):
         folder_size(tmp_path / "unplugged", 4096)
 
@@ -198,7 +191,7 @@ def test_source_root_that_fails_is_an_error(tmp_path):
     ),
     block=st.sampled_from([512, 4096, 128 * KB]),
 )
-def test_folder_size_always_matches_an_independent_sum(files, block):
+def test_d5_folder_size_always_matches_an_independent_sum(files, block):
     with tempfile.TemporaryDirectory() as folder:
         make_tree(Path(folder), {path: b"x" * size for path, size in files.items()})
 
@@ -230,13 +223,13 @@ def test_d6_block_size_asks_windows_about_the_backup_folder_itself(tmp_path, mon
     assert fake.roots == [f"{tmp_path / 'Backups'}\\"]
 
 
-def test_block_size_falls_back_to_4096_when_windows_refuses(tmp_path, monkeypatch):
+def test_d6_block_size_falls_back_to_4096_when_windows_refuses(tmp_path, monkeypatch):
     monkeypatch.setattr(space, "_kernel32", FakeKernel32(256, 512, ok=False))
 
     assert block_size(tmp_path) == 4096
 
 
-def test_block_size_of_this_drive_is_a_power_of_two(tmp_path):
+def test_d6_block_size_of_this_drive_is_a_power_of_two(tmp_path):
     size = block_size(tmp_path)
 
     assert size >= 512
@@ -261,7 +254,7 @@ def test_block_size_of_this_drive_is_a_power_of_two(tmp_path):
         (2048 * TB, "2048 TB"),
     ],
 )
-def test_format_size_uses_explorer_units(size, text):
+def test_d7_format_size_uses_explorer_units(size, text):
     assert format_size(size) == text
 
 
