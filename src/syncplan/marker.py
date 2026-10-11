@@ -45,18 +45,26 @@ class NewerMarker(MarkerError):
     pass
 
 
-def marker_path(folder: Path) -> Path:
+def _marker_path(folder: Path) -> Path:
     return folder / MARKER_DIR / MARKER_NAME
 
 
 def has_marker(folder: Path) -> bool:
-    """True if the folder has a marker file, whatever its content."""
-    return marker_path(folder).exists()
+    """True if the folder has a marker file, whatever its content.
+
+    Any error other than "not there", such as access denied, is raised: a marker that
+    can't be checked must not pass for no marker.
+    """
+    try:
+        _marker_path(folder).stat()
+    except FileNotFoundError, NotADirectoryError:
+        return False
+    return True
 
 
 def read_marker(folder: Path) -> Marker:
     """The marker check: the folder's marker, or a MarkerError saying why there is none."""
-    path = marker_path(folder)
+    path = _marker_path(folder)
     unreadable = UnreadableMarker(f"{path} can't be read; inspect it.")
     try:
         data = json.loads(path.read_text(encoding="utf-8-sig"))
@@ -74,6 +82,8 @@ def read_marker(folder: Path) -> Marker:
         raise NewerMarker(f"{path} was written by a newer syncplan; upgrade syncplan to use it.")
     try:
         created = datetime.fromisoformat(data["created"])
+        if type(data["sources"]) is not list:
+            raise TypeError(data["sources"])
         sources = tuple(
             Source(_text(item["name"]), Path(_text(item["path"]))) for item in data["sources"]
         )
@@ -108,7 +118,7 @@ def write_marker(folder: Path, sources: Sequence[Source]) -> Marker:
             file.write(text + "\n")
             file.flush()
             os.fsync(file.fileno())
-        temp.rename(marker_path(folder))
+        temp.rename(_marker_path(folder))
         done = True
     finally:
         if not done:

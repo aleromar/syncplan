@@ -7,13 +7,21 @@ from pathlib import Path
 _kernel32 = ctypes.windll.kernel32
 _DEFAULT_BLOCK = 4096
 _UNITS = ("KB", "MB", "GB", "TB")
+_WHOLE_FROM = 9.95  # sizes that would show as 10.0 or more drop the decimal (design D7)
 
 
 def block_size(folder: Path) -> int:
-    """The drive's block (cluster) size, or 4096 if Windows won't say (design D6)."""
+    """The block (cluster) size of the drive holding folder, or 4096 if Windows won't say (D6).
+
+    The folder itself is asked about, not its drive letter, so a drive mounted in a folder
+    reports its own blocks. Windows wants the path with a trailing backslash (SP4b).
+    """
+    asked = str(folder)
+    if not asked.endswith("\\"):
+        asked += "\\"
     sectors, sector_bytes, free, total = (ctypes.c_ulong() for _ in range(4))
     ok = _kernel32.GetDiskFreeSpaceW(
-        folder.anchor,
+        asked,
         ctypes.byref(sectors),
         ctypes.byref(sector_bytes),
         ctypes.byref(free),
@@ -49,6 +57,7 @@ def folder_size(folder: Path, block: int) -> tuple[int, int]:
         except OSError:
             if current == os.fspath(folder):
                 raise
+            folder.stat()  # still there? If the drive was unplugged, stop (§2 error table)
             skipped += 1
     return total, skipped
 
@@ -58,7 +67,7 @@ def format_size(size: int) -> str:
     if size < 1024:
         return "1 byte" if size == 1 else f"{size} bytes"
     value, units = size / 1024, list(_UNITS)
-    while round(value, 1 if value < 9.95 else 0) >= 1024 and len(units) > 1:
+    while round(value, 1 if value < _WHOLE_FROM else 0) >= 1024 and len(units) > 1:
         value /= 1024
         units.pop(0)
-    return f"{value:.1f} {units[0]}" if value < 9.95 else f"{value:.0f} {units[0]}"
+    return f"{value:.1f} {units[0]}" if value < _WHOLE_FROM else f"{value:.0f} {units[0]}"

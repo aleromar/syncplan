@@ -124,7 +124,7 @@ def test_file_symlink_inside_a_source_is_not_followed(tmp_path, sparse_file):
     try:
         (source / "link.bin").symlink_to(target)
     except OSError as error:
-        pytest.skip(f"file symlinks need admin rights or Developer Mode here (SP13): {error}")
+        pytest.skip(f"file symlinks need admin rights here (SP13): WinError {error.winerror}")
 
     assert folder_size(source, 4096) == (4096, 0)
 
@@ -221,12 +221,13 @@ class FakeKernel32:
         return self.ok
 
 
-def test_block_size_asks_windows_about_the_drive_root(tmp_path, monkeypatch):
+def test_d6_block_size_asks_windows_about_the_backup_folder_itself(tmp_path, monkeypatch):
+    # The folder itself, not its drive letter: a drive mounted in a folder has its own blocks.
     fake = FakeKernel32(256, 512)
     monkeypatch.setattr(space, "_kernel32", fake)
 
     assert block_size(tmp_path / "Backups") == 128 * KB
-    assert fake.roots == [tmp_path.anchor]
+    assert fake.roots == [f"{tmp_path / 'Backups'}\\"]
 
 
 def test_block_size_falls_back_to_4096_when_windows_refuses(tmp_path, monkeypatch):
@@ -269,11 +270,27 @@ def test_format_size_uses_explorer_units(size, text):
 
 @pytest.fixture
 def drive(monkeypatch):
-    """Pretend the backup drive has the given capacity and free space, and 4096-byte blocks."""
+    """Pretend the backup drive has the given capacity and free space, and 4096-byte blocks.
 
-    def set_drive(capacity: int, free: int) -> None:
-        monkeypatch.setattr(init, "disk_usage", lambda path: (capacity, capacity - free, free))
-        monkeypatch.setattr(space, "block_size", lambda folder: 4096)
+    Returns the folders that were asked about, so tests can check it was the backup.
+    """
+    asked: list[Path] = []
+
+    def disk_usage(path):
+        asked.append(Path(path))
+        return capacity_free[0], capacity_free[0] - capacity_free[1], capacity_free[1]
+
+    def fake_block_size(folder):
+        asked.append(Path(folder))
+        return 4096
+
+    capacity_free = [0, 0]
+
+    def set_drive(capacity: int, free: int) -> list[Path]:
+        capacity_free[:] = [capacity, free]
+        monkeypatch.setattr(init, "disk_usage", disk_usage)
+        monkeypatch.setattr(space, "block_size", fake_block_size)
+        return asked
 
     return set_drive
 
@@ -285,11 +302,12 @@ def two_sources(tmp_path):
 
 def test_r2_5_report_gives_each_size_the_total_and_free_space(tmp_path, run_cli, drive):
     backup, photos, docs = two_sources(tmp_path)
-    drive(capacity=1000 * MB, free=900 * MB)
+    asked = drive(capacity=1000 * MB, free=900 * MB)
 
     code, out, _ = run_cli("init", backup, photos, docs)
 
     assert code == 0
+    assert asked == [backup.resolve(), backup.resolve()]  # blocks and free space of the backup
     lines = out.splitlines()
     assert lines[0] == "Measuring sources..."
     assert any("Photos" in line and line.endswith("8.0 KB") for line in lines)
@@ -330,6 +348,20 @@ def test_r2_6_warning_names_an_old_copy_that_may_cover_part(tmp_path, run_cli, d
     assert f"An existing copy in {old_copy} (4.0 KB) may cover part of this" in out
 
 
+def test_r2_6_an_old_copy_that_cannot_be_measured_is_still_named(
+    tmp_path, run_cli, drive, failing_scandir
+):
+    backup, photos, _ = two_sources(tmp_path)
+    make_tree(backup, {"Photos/old.jpg": b"x" * 100})
+    drive(capacity=100 * MB, free=4 * KB)
+    failing_scandir(lambda path: path.parent.name == "backup", PermissionError(13, "denied"))
+
+    _, out, _ = run_cli("init", backup, photos)
+
+    old_copy = backup.resolve() / "Photos"
+    assert f"An existing copy in {old_copy} (size unknown) may cover part of this" in out
+
+
 def test_r2_6_space_needed_exactly_equal_to_free_space_fits(tmp_path, run_cli, drive):
     backup, photos, docs = two_sources(tmp_path)
     drive(capacity=1000 * MB, free=12 * KB)
@@ -350,36 +382,65 @@ def test_r2_7_warns_only_below_10_percent_left(tmp_path, run_cli, drive, free, w
 
     assert code == 0
     assert ("kept in quarantine on this drive" in out) is warned
+    if warned:
+        assert "only 100 MB (9%)" in out
 
 
-def test_r2_8_skipped_folders_are_mentioned_on_the_space_line(tmp_path, run_cli, monkeypatch):
+@pytest.mark.parametrize(
+    ("locked", "note"),
+    [
+        (["locked"], "(1 folder couldn't be read and isn't counted)"),
+        (["locked", "secret"], "(2 folders couldn't be read and aren't counted)"),
+    ],
+)
+def test_r2_8_skipped_folders_are_mentioned_on_the_space_line(
+    tmp_path, run_cli, failing_scandir, locked, note
+):
     backup, photos, _ = two_sources(tmp_path)
-    make_tree(photos, {"locked/c.jpg": "x"})
-    real_scandir = os.scandir
-
-    def scandir(path):
-        if Path(path).name == "locked":
-            raise PermissionError(13, "Access is denied")
-        return real_scandir(path)
-
-    monkeypatch.setattr(space.os, "scandir", scandir)
+    make_tree(photos, {f"{name}/c.jpg": "x" for name in locked})
+    failing_scandir(lambda path: path.name in locked, PermissionError(13, "Access is denied"))
 
     code, out, _ = run_cli("init", backup, photos)
 
     assert code == 0
-    assert "(1 folder couldn't be read and isn't counted)" in out
+    assert note in out
 
 
-def test_source_root_failing_while_measuring_stops_before_writing(tmp_path, run_cli, monkeypatch):
+def test_r2_5_source_root_failing_while_measuring_stops_before_writing(
+    tmp_path, run_cli, failing_scandir
+):
     backup, photos, _ = two_sources(tmp_path)
-    real_scandir = os.scandir
+    root = photos.resolve()
+    failing_scandir(lambda path: path == root, OSError(21, "The device is not ready", str(root)))
+
+    code, _, err = run_cli("init", backup, photos)
+
+    assert code == 1
+    assert f"{root}: The device is not ready." in err
+    assert not (backup / ".syncplan").exists()
+
+
+def test_r2_5_source_drive_unplugged_during_the_walk_stops(tmp_path, run_cli, monkeypatch):
+    # Once the drive is gone every subfolder fails too; that must not pass as a few skipped ones.
+    backup, photos, _ = two_sources(tmp_path)
+    make_tree(photos, {"sub/c.jpg": "x"})
+    root = photos.resolve()
+    real_scandir, real_stat = os.scandir, os.stat
+    unplugged = []
 
     def scandir(path):
-        if Path(path) == photos.resolve():
-            raise OSError(21, "The device is not ready")
+        if Path(path) != root:
+            raise OSError(21, "The device is not ready", str(path))
+        unplugged.append(True)  # the drive goes away right after its top folder is listed
         return real_scandir(path)
 
+    def stat(path, *args, **kwargs):
+        if unplugged and Path(path) == root:
+            raise OSError(21, "The device is not ready", str(path))
+        return real_stat(path, *args, **kwargs)
+
     monkeypatch.setattr(space.os, "scandir", scandir)
+    monkeypatch.setattr(space.os, "stat", stat)
 
     code, _, err = run_cli("init", backup, photos)
 

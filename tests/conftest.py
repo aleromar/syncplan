@@ -2,6 +2,7 @@
 
 import ctypes
 import msvcrt
+import os
 import subprocess
 from ctypes import wintypes
 from pathlib import Path
@@ -11,7 +12,10 @@ import pytest
 from syncplan import cli
 
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_kernel32.GetCompressedFileSizeW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(wintypes.DWORD)]
+_kernel32.GetCompressedFileSizeW.restype = wintypes.DWORD  # unsigned, or big sizes go negative
 _FSCTL_SET_SPARSE = 0x000900C4
+_INVALID_FILE_SIZE = 0xFFFFFFFF
 
 
 def make_tree(root: Path, entries: dict[str, str | bytes | None]) -> Path:
@@ -30,7 +34,36 @@ def size_on_disk(path: Path) -> int:
     """Bytes the file really occupies on disk, which for a sparse file is far below its size."""
     high = wintypes.DWORD()
     low = _kernel32.GetCompressedFileSizeW(str(path), ctypes.byref(high))
+    if low == _INVALID_FILE_SIZE and ctypes.get_last_error():
+        raise ctypes.WinError(ctypes.get_last_error())
     return (high.value << 32) + low
+
+
+@pytest.fixture
+def failing_scandir(monkeypatch):
+    """Make listing a folder fail with the given error when the predicate matches its path."""
+
+    def fail(matches, error: OSError) -> None:
+        real_scandir = os.scandir
+
+        def scandir(path):
+            if matches(Path(path)):
+                raise error
+            return real_scandir(path)
+
+        monkeypatch.setattr(os, "scandir", scandir)
+
+    return fail
+
+
+@pytest.fixture
+def full_disk(monkeypatch):
+    """Make the marker write fail as if the drive were full (R1.6)."""
+
+    def fsync(fd):
+        raise OSError(28, "There is not enough space on the disk")
+
+    monkeypatch.setattr(os, "fsync", fsync)
 
 
 @pytest.fixture

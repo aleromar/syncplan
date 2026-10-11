@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import subprocess
@@ -518,7 +519,13 @@ def test_r3_7_a_junction_where_the_subfolder_would_be_is_refused(tmp_path, run_c
     assert refused_and_nothing_written(result, backup, "is a link")
 
 
-def test_nfr1_overlap_is_found_whatever_the_letter_case(tmp_path, run_cli):
+@pytest.fixture
+def typed_case_kept(monkeypatch):
+    """resolve() would restore the on-disk letter case and hide case-sensitive comparisons."""
+    monkeypatch.setattr(Path, "resolve", Path.absolute)
+
+
+def test_nfr1_overlap_is_found_whatever_the_letter_case(tmp_path, run_cli, typed_case_kept):
     home = make_tree(tmp_path, {"me/Backup": None}) / "me"
 
     result = run_cli("init", home / "Backup", str(home).upper())
@@ -526,12 +533,23 @@ def test_nfr1_overlap_is_found_whatever_the_letter_case(tmp_path, run_cli):
     assert refused_and_nothing_written(result, home / "Backup", "is inside the source")
 
 
-def test_nfr1_the_same_source_in_another_case_is_a_duplicate(tmp_path, run_cli):
+def test_nfr1_the_same_source_in_another_case_is_a_duplicate(tmp_path, run_cli, typed_case_kept):
     backup, photos, _ = setup_folders(tmp_path)
 
     result = run_cli("init", backup, photos, f"Again={str(photos).lower()}")
 
     assert refused_and_nothing_written(result, backup, "is given twice")
+
+
+def test_nfr1_names_differing_beyond_letter_case_do_not_clash(tmp_path, run_cli):
+    # Windows keeps Straße and Strasse as two different folders, so they may sit side by side.
+    make_tree(tmp_path, {"a/Straße/x": "x", "b/Strasse/y": "y", "backup": None})
+
+    code, _, err = run_cli(
+        "init", tmp_path / "backup", tmp_path / "a" / "Straße", tmp_path / "b" / "Strasse"
+    )
+
+    assert code == 0, err
 
 
 def test_nfr1_names_differing_only_in_case_clash(tmp_path, run_cli):
@@ -564,3 +582,115 @@ def test_d2_plain_path_has_no_name():
 def test_d8_bare_drive_means_its_top_folder():
     assert read_argument("E:") == (None, Path("E:\\"))
     assert read_argument("Stick=E:") == ("Stick", Path("E:\\"))
+
+
+# Review fixes: basic cases only (R2.9, R2.10, R3.8) and the panel's findings
+
+
+def test_r2_9_syncplan_that_is_a_file_is_refused(tmp_path, run_cli):
+    backup, photos, _ = setup_folders(tmp_path)
+    make_tree(backup, {".syncplan": "a file"})
+
+    code, _, err = run_cli("init", backup, photos)
+
+    assert code == 1
+    assert ".syncplan is not a real folder" in err
+    assert (backup / ".syncplan").read_text() == "a file"
+
+
+def test_r2_9_syncplan_that_points_into_a_source_is_refused(tmp_path, run_cli, junction):
+    backup, photos, _ = setup_folders(tmp_path)
+    junction(backup / ".syncplan", photos)
+
+    code, _, err = run_cli("init", backup, photos)
+
+    assert code == 1
+    assert ".syncplan is not a real folder" in err
+    assert sorted(p.name for p in photos.iterdir()) == ["a.jpg"]
+
+
+@pytest.mark.parametrize("prefix", ["\\\\server\\share\\", "\\\\?\\"])
+def test_r2_10_backup_path_starting_with_backslashes_is_refused(tmp_path, run_cli, prefix):
+    backup, photos, _ = setup_folders(tmp_path)
+    typed = prefix + (str(backup) if prefix == "\\\\?\\" else "Backups")
+
+    code, _, err = run_cli("init", typed, photos)
+
+    assert code == 1
+    assert "drive letter" in err
+    assert not (backup / ".syncplan").exists()
+
+
+def test_r2_10_backup_with_a_broken_character_is_refused(tmp_path, run_cli):
+    _, photos, _ = setup_folders(tmp_path)
+    odd = tmp_path / "B\udc80ckup"
+    odd.mkdir()
+
+    code, _, err = run_cli("init", odd, photos)
+
+    assert code == 1
+    assert "\\udc80" in err
+    assert "rename" in err
+    assert not (odd / ".syncplan").exists()
+
+
+@pytest.mark.parametrize("prefix", ["\\\\server\\share\\", "\\\\?\\"])
+def test_r3_8_source_path_starting_with_backslashes_is_refused(tmp_path, run_cli, prefix):
+    backup, photos, _ = setup_folders(tmp_path)
+    typed = prefix + (str(photos) if prefix == "\\\\?\\" else "Photos")
+
+    result = run_cli("init", backup, typed)
+
+    assert refused_and_nothing_written(result, backup, "drive letter")
+
+
+def test_r3_8_source_folder_with_a_broken_character_is_refused(tmp_path, run_cli):
+    backup, _, _ = setup_folders(tmp_path)
+    odd = make_tree(tmp_path, {"Old\udc80Photos/a.jpg": "a"}) / "Old\udc80Photos"
+
+    result = run_cli("init", backup, odd)
+
+    assert refused_and_nothing_written(result, backup, "Old\\udc80Photos", "rename")
+
+
+def test_r3_8_name_with_a_broken_character_is_refused(tmp_path, run_cli):
+    backup, photos, _ = setup_folders(tmp_path)
+
+    result = run_cli("init", backup, f"P\ud800ics={photos}")
+
+    assert refused_and_nothing_written(result, backup)
+
+
+def test_r2_4_marker_above_that_cannot_be_checked_stops(tmp_path, run_cli, monkeypatch):
+    backup, photos, _ = setup_folders(tmp_path)
+    real_stat = Path.stat
+
+    def denied(self, *args, **kwargs):
+        if self.name == "marker.json" and self.parent.parent == tmp_path.resolve():
+            raise PermissionError(13, "Access is denied", str(self))
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", denied)
+
+    code, _, err = run_cli("init", backup, photos)
+
+    assert code == 1
+    assert "Access is denied" in err
+    assert not (backup / ".syncplan").exists()
+
+
+def test_r3_6_suggestion_keeps_chosen_names_spaces_and_whole_drives(tmp_path, run_cli):
+    other = make_tree(tmp_path, {"other": None, "My Photos/a.jpg": "a", "backup": None}) / "other"
+    listed = [
+        {"name": "Pics", "path": str(tmp_path / "My Photos")},
+        {"name": "Stick", "path": "F:\\"},
+    ]
+    marker_json = {"syncplan_marker": 1, "created": "2026-10-08T16:40:00+02:00", "sources": listed}
+    make_tree(other, {".syncplan/marker.json": json.dumps(marker_json)})
+
+    result = run_cli("init", tmp_path / "backup", other)
+
+    assert refused_and_nothing_written(
+        result, tmp_path / "backup", f'"Pics={tmp_path / "My Photos"}"'
+    )
+    assert result[2].rstrip().endswith(" Stick=F:")  # F: alone, as a trailing \ breaks quoting

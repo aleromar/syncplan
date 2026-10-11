@@ -87,6 +87,8 @@ def test_r4_2_syncplan_folder_without_marker_is_not_initialized(tmp_path):
         json.dumps({**VALID, "sources": [{"name": "Photos"}]}),
         json.dumps({**VALID, "sources": [{"name": 7, "path": "C:\\Photos"}]}),
         json.dumps({**VALID, "sources": [["Photos", "C:\\Photos"]]}),
+        json.dumps({**VALID, "sources": {}}),
+        json.dumps({**VALID, "sources": ""}),
     ],
 )
 def test_r4_3_damaged_marker_is_unreadable(tmp_path, content):
@@ -165,6 +167,21 @@ def test_has_marker_is_false_without_marker_file(tmp_path):
     (tmp_path / ".syncplan").mkdir()
 
     assert not has_marker(tmp_path)
+
+
+def test_has_marker_raises_when_it_cannot_look(tmp_path, monkeypatch):
+    # A marker hidden by a permission error must not pass for "no marker" (R2.4, R3.6).
+    real_stat = Path.stat
+
+    def denied(self, *args, **kwargs):
+        if self.name == "marker.json":
+            raise PermissionError(13, "Access is denied", str(self))
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", denied)
+
+    with pytest.raises(PermissionError):
+        has_marker(tmp_path)
 
 
 def test_has_marker_is_true_whatever_the_marker_says(tmp_path):
