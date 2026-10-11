@@ -39,6 +39,21 @@ Space needed: about 400 GB. E:\ has 1.8 TB free.
   - a subfolder name can't be used on Windows.
 - **Space.** It estimates the space needed and warns, without stopping, if the drive looks too small or would be left with less than 10% free.
 - **Redundancy.** You can back up the same sources to several drives: run `init` once per drive.
+- **Not a backup source.** syncplan's own folder, `C:\ProgramData\syncplan`, can't be one, so a whole `C:` drive is refused; back up its folders instead.
+
+## Logs
+
+Every run writes what it did, step by step, to a log file on your PC:
+
+```
+C:\ProgramData\syncplan\logs\syncplan.log
+```
+
+- **What it holds.** Each run gets a short run ID. The log records the syncplan, Python and Windows versions, the exact command, each check and its outcome, the sizes and timings measured, what was written, and how the run ended. For an error, it also holds the full technical details.
+- **On screen.** You see the normal messages; warnings and errors go to the error output. An error message ends with `Details:` and the log's location.
+- **Size.** When the log reaches 1 MiB, the next run starts a new one. syncplan keeps the 5 previous logs (`syncplan.log.1` to `.5`), so they never take more than about 6 MB.
+- **Location.** `C:\ProgramData` is a hidden Windows folder outside your user folder, so backing up your files never includes the log.
+- **One run at a time.** syncplan runs one command at a time on a PC. A second window is refused until the first one finishes.
 
 ## Install
 
