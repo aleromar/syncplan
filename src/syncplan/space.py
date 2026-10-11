@@ -31,7 +31,11 @@ def block_size(folder: Path) -> int:
         ctypes.byref(total),
     )
     size = sectors.value * sector_bytes.value
-    return size if ok and size else _DEFAULT_BLOCK
+    if ok and size:
+        logger.debug("block size of %s: %d bytes", folder, size)
+        return size
+    logger.debug("block size of %s: assumed %d bytes (Windows didn't say)", folder, _DEFAULT_BLOCK)
+    return _DEFAULT_BLOCK
 
 
 def folder_size(folder: Path, block: int) -> tuple[int, int]:

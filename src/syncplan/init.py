@@ -13,7 +13,6 @@ from pathlib import Path
 from shutil import disk_usage
 
 from syncplan import log, space
-from syncplan.log import logger
 from syncplan.marker import (
     MARKER_DIR,
     Marker,
@@ -26,6 +25,7 @@ from syncplan.marker import (
 )
 from syncplan.space import format_size
 
+logger = logging.getLogger(__name__)
 _FORBIDDEN = frozenset('\\/:*?"<>|')
 _MAX_NAME = 255  # UTF-16 units, as Windows counts them
 _FREE_SHARE = 10  # warn when less than 1/10 of the drive would be left (R2.7)
@@ -59,6 +59,7 @@ def check_init(backup: str, sources: Sequence[str]) -> Setup:
     given = [(name, _resolve(path)) for name, path in map(read_argument, sources)]
     for _, path in given:
         _check_source(path, backup_dir)
+        logger.debug("source %s: exists, not syncplan's or a backup, apart from the backup", path)
     for (_, first), (_, second) in combinations(given, 2):
         _check_apart(first, second)
     named = [Source(subfolder_name(name, path), path) for name, path in given]
@@ -98,7 +99,7 @@ def check_name(name: str) -> None:
 
 def finish_init(setup: Setup) -> None:
     """Steps 5-7: measure, write the marker, then report through the logger (R1.4, R5.5)."""
-    sizes, space_lines = _measure(setup) if setup.sources else ([], [])
+    sizes, space_line, warnings = _measure(setup) if setup.sources else ([], None, [])
     try:
         write_marker(setup.backup, setup.sources)
     except OSError as error:
@@ -110,12 +111,13 @@ def finish_init(setup: Setup) -> None:
         raise Refusal(
             f"Couldn't write the marker in {setup.backup / MARKER_DIR}: {reason}."
         ) from error
-    logger.debug("marker written: %s", setup.backup / MARKER_DIR / "marker.json")
     logger.info("Initialized syncplan backup at %s", setup.backup)
     for line in _source_lines(setup.sources, [format_size(size) for size in sizes]):
         logger.info("%s", line)
-    for level, line in space_lines:
-        logger.log(level, "%s", line)
+    if space_line is not None:
+        logger.info("%s", space_line)
+    for warning in warnings:
+        logger.warning("%s", warning)
 
 
 def _resolve(path: Path) -> Path:
@@ -143,8 +145,8 @@ def _broken(text: str) -> bool:
     return False
 
 
-def _measure(setup: Setup) -> tuple[list[int], list[tuple[int, str]]]:
-    """R2.5-R2.8: the space each source needs, and warnings if the drive looks short."""
+def _measure(setup: Setup) -> tuple[list[int], str, list[str]]:
+    """R2.5-R2.8: each source's size, the space line, and warnings if the drive looks short."""
     block = space.block_size(setup.backup)
     sizes, skipped = [], 0
     for source in setup.sources:
@@ -154,42 +156,34 @@ def _measure(setup: Setup) -> tuple[list[int], list[tuple[int, str]]]:
     needed = sum(sizes)
     capacity, _, free = disk_usage(setup.backup)
     drive = setup.backup.anchor
+    logger.debug("drive %s: capacity %s, free %s", drive, format_size(capacity), format_size(free))
     line = f"Space needed: about {format_size(needed)}. {drive} has {format_size(free)} free."
     if skipped == 1:
         line += " (1 folder couldn't be read and isn't counted)"
     elif skipped:
         line += f" ({skipped} folders couldn't be read and aren't counted)"
-    lines = [(logging.INFO, line)]
+    warnings = []
     if needed > free:
-        lines.append(
-            (
-                logging.WARNING,
-                f"Warning: about {format_size(needed - free)} short."
-                " The first apply will stop before copying unless you free space.",
-            )
+        warnings.append(
+            f"Warning: about {format_size(needed - free)} short."
+            " The first apply will stop before copying unless you free space."
         )
         for folder in setup.adopted:
             try:
                 copy = format_size(space.folder_size(folder, block)[0])
             except OSError:
                 copy = "size unknown"
-            lines.append(
-                (
-                    logging.WARNING,
-                    f"An existing copy in {folder} ({copy}) may cover part of this;"
-                    " the first plan gives the exact figure.",
-                )
+            warnings.append(
+                f"An existing copy in {folder} ({copy}) may cover part of this;"
+                " the first plan gives the exact figure."
             )
     elif (left := free - needed) * _FREE_SHARE < capacity:
-        lines.append(
-            (
-                logging.WARNING,
-                f"Note: after the first backup only {format_size(left)}"
-                f" ({left * 100 // capacity}%) of {drive} would be free. Overwritten and deleted"
-                " files are kept in quarantine on this drive, so it may fill up.",
-            )
+        warnings.append(
+            f"Note: after the first backup only {format_size(left)} ({left * 100 // capacity}%)"
+            f" of {drive} would be free. Overwritten and deleted files are kept in quarantine"
+            " on this drive, so it may fill up."
         )
-    return sizes, lines
+    return sizes, line, warnings
 
 
 def _check_folder(path: Path) -> None:
@@ -223,16 +217,19 @@ def _check_source(path: Path, backup_dir: Path) -> None:
     """R3.1, R3.9, R3.6 and R3.2 for one source. Paths are resolved, so links can't hide."""
     _check_folder(path)
     own = log.home().resolve()
-    if path == own or own.is_relative_to(path):
+    if path == own:
+        raise Refusal(f"{path} is syncplan's own folder; it can't be backed up.")
+    if path.is_relative_to(own):
+        raise Refusal(f"{path} is inside syncplan's own folder ({own}); it can't be backed up.")
+    if own.is_relative_to(path):
         raise Refusal(
             f"{path} holds syncplan's own folder ({own}); back up its folders instead,"
             " for example C:\\Users\\you."
         )
-    if path.is_relative_to(own):
-        raise Refusal(f"{path} is inside syncplan's own folder ({own}); it can't be backed up.")
     for folder in (path, *path.parents):
         if has_marker(folder):
-            raise Refusal(_backup_as_source(path, folder, backup_dir))
+            message, cause = _backup_as_source(path, folder, backup_dir)
+            raise Refusal(message) from cause  # a Windows error behind it gets Details (R5.2)
     if path == backup_dir:
         raise Refusal(f"{path} is both the backup and a source.")
     if backup_dir.is_relative_to(path):
@@ -280,8 +277,11 @@ def _check_subfolder(target: Path, source: Source) -> None:
     )
 
 
-def _backup_as_source(path: Path, outer: Path, backup_dir: Path) -> str:
-    """R3.6: name the backup that holds the source, and suggest its own sources instead."""
+def _backup_as_source(path: Path, outer: Path, backup_dir: Path) -> tuple[str, Exception | None]:
+    """R3.6: name the backup that holds the source, and suggest its own sources instead.
+
+    Returns the message, and the marker check's error when the marker couldn't be read.
+    """
     if path == outer:
         intro = f"{outer} is a syncplan backup."
     else:
@@ -289,10 +289,10 @@ def _backup_as_source(path: Path, outer: Path, backup_dir: Path) -> str:
     try:
         sources = read_marker(outer).sources
     except MarkerError as error:
-        return f"{intro} {error}"
+        return f"{intro} {error}", error
     arguments = " ".join(_quoted(_argument(s)) for s in sources)
     command = f"syncplan init {_quoted(str(backup_dir))} {arguments}"
-    return f"{intro} Back up its sources instead:\n  {command}"
+    return f"{intro} Back up its sources instead:\n  {command}", None
 
 
 def _argument(source: Source) -> str:

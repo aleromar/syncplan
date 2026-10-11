@@ -7,7 +7,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
-from conftest import make_tree
+from conftest import make_tree, setup_folders
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
@@ -22,11 +22,6 @@ def sources_of(backup: Path) -> tuple[Source, ...]:
 
 def lists_source(report: str, name: str, path: Path) -> bool:
     return re.search(rf"^\s+{re.escape(name)}\s+<- {re.escape(str(path))}(\s|$)", report, re.M)
-
-
-def setup_folders(tmp_path: Path) -> tuple[Path, Path, Path]:
-    make_tree(tmp_path, {"src/Photos/a.jpg": "a", "src/Docs/b.txt": "b", "backup": None})
-    return tmp_path / "backup", tmp_path / "src" / "Photos", tmp_path / "src" / "Docs"
 
 
 # R1 Initialize a backup

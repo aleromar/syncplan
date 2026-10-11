@@ -30,6 +30,12 @@ def make_tree(root: Path, entries: dict[str, str | bytes | None]) -> Path:
     return root
 
 
+def setup_folders(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """An empty backup folder and two sources. Returns (backup, Photos, Docs)."""
+    make_tree(tmp_path, {"src/Photos/a.jpg": "a", "src/Docs/b.txt": "b", "backup": None})
+    return tmp_path / "backup", tmp_path / "src" / "Photos", tmp_path / "src" / "Docs"
+
+
 def size_on_disk(path: Path) -> int:
     """Bytes the file really occupies on disk, which for a sparse file is far below its size."""
     high = wintypes.DWORD()

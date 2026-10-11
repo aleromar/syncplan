@@ -1,22 +1,23 @@
 """Command-line entry point for syncplan.
 
-Nothing here prints: every message goes to the `syncplan` logger (design D21).
+Nothing here prints: every message goes to the `syncplan` loggers (design D21).
 """
 
 import argparse
 import logging
 import sys
 from importlib.metadata import version
-from pathlib import Path
+from typing import IO
 
 from syncplan import init, log
-from syncplan.log import logger
+
+logger = logging.getLogger(__name__)
 
 
 class _Parser(argparse.ArgumentParser):
     """argparse with its help, usage and errors sent through the logger instead of printed."""
 
-    def _print_message(self, message: str, file=None) -> None:
+    def _print_message(self, message: str, file: IO[str] | None = None) -> None:
         if message:
             level = logging.ERROR if file is sys.stderr else logging.INFO
             logger.log(level, "%s", message.rstrip("\n"))
@@ -31,8 +32,8 @@ def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     outcome: int | str = 1
     try:
-        log_path = log.start(argv)
-        outcome = _run(argv, log_path)
+        log.start(argv)
+        outcome = _run(argv)
         return outcome
     except log.CannotStart as blocked:
         logger.error("%s", blocked)
@@ -47,7 +48,7 @@ def main(argv: list[str] | None = None) -> int:
         log.end(outcome)
 
 
-def _run(argv: list[str], log_path: Path | None) -> int:
+def _run(argv: list[str]) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     if args.command is None:
@@ -66,14 +67,13 @@ def _run(argv: list[str], log_path: Path | None) -> int:
         logger.error("%s", refusal, exc_info=True)
     except OSError as error:
         reason = f"{error.strerror or error}."
-        logger.error(
-            "%s", f"{error.filename}: {reason}" if error.filename else reason, exc_info=True
-        )
+        message = f"{error.filename}: {reason}" if error.filename else reason
+        logger.error("%s", message, exc_info=True)
     except Exception as error:
         problem = f"{type(error).__name__}: {error}"
         logger.error("syncplan hit an unexpected problem (%s).", problem, exc_info=True)
-    if log.logging_to_file():  # R5.2: the details are in the log; otherwise on screen (R5.4)
-        logger.error("Details: %s", log_path)
+    if (path := log.log_file()) is not None:  # R5.2; otherwise the screen had it (R5.4)
+        logger.error("Details: %s", path)
     return 1
 
 
@@ -81,6 +81,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = _Parser(
         prog="syncplan",
         description="Back up folders to a backup drive from a plan you review first.",
+        color=False,  # no terminal colour codes in the log
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {version('syncplan')}")
     commands = parser.add_subparsers(dest="command", metavar="COMMAND")

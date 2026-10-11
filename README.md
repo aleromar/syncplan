@@ -51,9 +51,12 @@ C:\ProgramData\syncplan\logs\syncplan.log
 
 - **What it holds.** Each run gets a short run ID. The log records the syncplan, Python and Windows versions, the exact command, each check and its outcome, the sizes and timings measured, what was written, and how the run ended. For an error, it also holds the full technical details.
 - **On screen.** You see the normal messages; warnings and errors go to the error output. An error message ends with `Details:` and the log's location.
-- **Size.** When the log reaches 1 MiB, the next run starts a new one. syncplan keeps the 5 previous logs (`syncplan.log.1` to `.5`), so they never take more than about 6 MB.
+- **Size.** When the log reaches 1 MB (1,048,576 bytes), the next run starts a new one. syncplan keeps the 5 previous logs (`syncplan.log.1` to `.5`), so they never take more than about 6 MB.
 - **Location.** `C:\ProgramData` is a hidden Windows folder outside your user folder, so backing up your files never includes the log.
+- **Real files only.** If `C:\ProgramData\syncplan`, a folder above it, or the log itself is a link to somewhere else, syncplan refuses to run. Otherwise its log could end up inside a folder you back up.
 - **One run at a time.** syncplan runs one command at a time on a PC. A second window is refused until the first one finishes.
+- **On a shared PC,** every Windows account on it can read the log, which holds folder names and commands.
+- **If you see "couldn't write the log"** after once running syncplan as administrator, that run made the log folder belong to administrators. Delete `C:\ProgramData\syncplan` from an administrator window, and the next normal run recreates it.
 
 ## Install
 

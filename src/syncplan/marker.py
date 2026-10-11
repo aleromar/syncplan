@@ -8,7 +8,6 @@ import logging
 import os
 import tempfile
 from collections.abc import Sequence
-from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -122,21 +121,29 @@ def write_marker(folder: Path, sources: Sequence[Source]) -> Marker:
             os.fsync(file.fileno())
         temp.rename(_marker_path(folder))
         done = True
+        logger.debug("marker written: %s", _marker_path(folder))
     finally:
         if not done:
-            removed = []
-            with suppress(OSError):
-                if temp is not None:
-                    temp.unlink()
-                    removed.append(temp.name)
-            if created_dir:
-                with suppress(OSError):
-                    own_dir.rmdir()
-                    removed.append(own_dir.name)
-            logger.debug(
-                "marker write failed; cleanup removed: %s", ", ".join(removed) or "nothing"
-            )
+            _clean_up([temp] + ([own_dir] if created_dir else []))
     return marker
+
+
+def _clean_up(leftovers: list[Path | None]) -> None:
+    """After a failed write: remove what this write created, and log what stayed (R1.6)."""
+    removed, left = [], []
+    for path in leftovers:
+        if path is None:
+            continue
+        try:
+            path.rmdir() if path.is_dir() else path.unlink()
+            removed.append(path.name)
+        except OSError as error:
+            left.append(f"{path} ({error.strerror or error})")
+    logger.debug(
+        "marker write failed; cleanup removed: %s%s",
+        ", ".join(removed) or "nothing",
+        f"; left: {', '.join(left)}" if left else "",
+    )
 
 
 def _text(value: object) -> str:
