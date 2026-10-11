@@ -177,6 +177,126 @@ def test_r1_7_the_same_source_can_go_to_a_second_backup(tmp_path, run_cli):
     assert sources_of(backup) == sources_of(second) == (Source("Photos", photos.resolve()),)
 
 
+# R2.1-R2.4 Check the backup folder
+
+
+def test_r2_1_missing_backup_folder_is_refused_and_not_created(tmp_path, run_cli):
+    _, photos, _ = setup_folders(tmp_path)
+    missing = tmp_path / "Backpus"
+
+    code, _, err = run_cli("init", missing, photos)
+
+    assert code == 1
+    assert f"{missing} does not exist" in err
+    assert not missing.exists()
+
+
+def test_r2_1_backup_that_is_a_file_is_refused(tmp_path, run_cli):
+    _, photos, _ = setup_folders(tmp_path)
+    file = make_tree(tmp_path, {"file.txt": "x"}) / "file.txt"
+
+    code, _, err = run_cli("init", file, photos)
+
+    assert code == 1
+    assert "is not a folder" in err
+
+
+def test_r2_2_existing_backup_is_refused_showing_its_date_and_sources(tmp_path, run_cli):
+    backup, photos, docs = setup_folders(tmp_path)
+    run_cli("init", backup, photos)
+    before = (backup / ".syncplan" / "marker.json").read_bytes()
+    created = read_marker(backup).created.date().isoformat()
+
+    code, _, err = run_cli("init", backup, docs)
+
+    assert code == 1
+    assert f"is already a syncplan backup (created {created})" in err
+    assert lists_source(err, "Photos", photos.resolve())
+    assert "syncplan add / syncplan remove" in err
+    assert (backup / ".syncplan" / "marker.json").read_bytes() == before
+
+
+def test_r2_3_unreadable_marker_is_refused_and_left_untouched(tmp_path, run_cli):
+    backup, photos, _ = setup_folders(tmp_path)
+    make_tree(backup, {".syncplan/marker.json": "damaged"})
+
+    code, _, err = run_cli("init", backup, photos)
+
+    assert code == 1
+    assert "can't be read; inspect it" in err
+    assert (backup / ".syncplan" / "marker.json").read_text() == "damaged"
+
+
+def test_r2_3_marker_from_a_newer_syncplan_is_refused(tmp_path, run_cli):
+    backup, photos, _ = setup_folders(tmp_path)
+    make_tree(backup, {".syncplan/marker.json": '{"syncplan_marker": 99}'})
+
+    code, _, err = run_cli("init", backup, photos)
+
+    assert code == 1
+    assert "upgrade" in err
+
+
+def test_r2_4_backup_inside_another_backup_is_refused(tmp_path, run_cli):
+    backup, photos, _ = setup_folders(tmp_path)
+    run_cli("init", backup)
+    inner = make_tree(backup, {"Other": None}) / "Other"
+
+    code, _, err = run_cli("init", inner, photos)
+
+    assert code == 1
+    assert f"{inner.resolve()} is inside the syncplan backup {backup.resolve()}" in err
+    assert not (inner / ".syncplan").exists()
+
+
+def test_r2_4_damaged_marker_above_still_counts_as_a_backup(tmp_path, run_cli):
+    backup, photos, _ = setup_folders(tmp_path)
+    make_tree(backup, {".syncplan/marker.json": "damaged", "Other": None})
+
+    code, _, err = run_cli("init", backup / "Other", photos)
+
+    assert code == 1
+    assert "is inside the syncplan backup" in err
+
+
+def test_r2_4_relative_path_into_a_backup_is_refused(tmp_path, run_cli, monkeypatch):
+    backup, photos, _ = setup_folders(tmp_path)
+    run_cli("init", backup)
+    make_tree(backup, {"Sub/Other": None})
+    monkeypatch.chdir(backup / "Sub")
+
+    code, _, err = run_cli("init", "Other", photos)
+
+    assert code == 1
+    assert "is inside the syncplan backup" in err
+
+
+def test_r2_4_junction_into_a_backup_is_refused(tmp_path, run_cli, junction):
+    backup, photos, _ = setup_folders(tmp_path)
+    run_cli("init", backup)
+    inner = make_tree(backup, {"Other": None}) / "Other"
+    link = junction(tmp_path / "LooksSafe", inner)
+
+    code, _, err = run_cli("init", link, photos)
+
+    assert code == 1
+    assert "is inside the syncplan backup" in err
+
+
+def test_r2_2_folder_own_marker_is_reported_before_one_above_it(tmp_path, run_cli):
+    # Design D3: for a whole-drive backup like E:\ (no folders above) and for nested
+    # leftovers alike, the folder's own marker decides the message.
+    backup, photos, _ = setup_folders(tmp_path)
+    make_tree(backup, {"Inner": None})
+    run_cli("init", backup / "Inner")
+    run_cli("init", backup)
+
+    code, _, err = run_cli("init", backup / "Inner", photos)
+
+    assert code == 1
+    assert "is already a syncplan backup" in err
+
+
 # Reading arguments (D2, D8)
 
 

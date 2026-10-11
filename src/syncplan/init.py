@@ -7,7 +7,16 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from syncplan.marker import MARKER_DIR, Source, has_marker, write_marker
+from syncplan.marker import (
+    MARKER_DIR,
+    Marker,
+    MarkerError,
+    NotInitialized,
+    Source,
+    has_marker,
+    read_marker,
+    write_marker,
+)
 
 
 class Refusal(Exception):
@@ -33,6 +42,7 @@ def read_argument(text: str) -> tuple[str | None, Path]:
 def check_init(backup: str, sources: Sequence[str]) -> Setup:
     """Steps 1-4: resolve every path, then refuse anything unsafe. Nothing is written."""
     root = _bare_drive(Path(backup)).resolve()
+    _check_backup(root)
     named = []
     for name, path in (read_argument(text) for text in sources):
         path = path.resolve()
@@ -73,6 +83,36 @@ def source_lines(sources: Sequence[Source], sizes: Sequence[str] = ()) -> list[s
             line = f"{line:<{name_width + path_width + 6}}  {sizes[index]:>{size_width}}"
         lines.append(line)
     return lines
+
+
+def _check_backup(root: Path) -> None:
+    """R2.1-R2.4. The folder's own marker comes before the folders above it (design D3)."""
+    if not root.exists():
+        raise Refusal(f"{root} does not exist.")
+    if not root.is_dir():
+        raise Refusal(f"{root} is not a folder.")
+    try:
+        existing = read_marker(root)
+    except NotInitialized:
+        pass
+    except MarkerError as error:
+        raise Refusal(str(error)) from None
+    else:
+        raise Refusal(_already_a_backup(root, existing))
+    for parent in root.parents:
+        if has_marker(parent):
+            raise Refusal(f"{root} is inside the syncplan backup {parent}.")
+
+
+def _already_a_backup(root: Path, existing: Marker) -> str:
+    return "\n".join(
+        [
+            f"{root} is already a syncplan backup (created {existing.created.date()}).",
+            "Its sources:",
+            *source_lines(existing.sources),
+            "To change them, use syncplan add / syncplan remove.",
+        ]
+    )
 
 
 def _bare_drive(path: Path) -> Path:
