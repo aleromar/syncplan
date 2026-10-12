@@ -2,16 +2,61 @@
 
 Back up folders to a backup drive without surprises. syncplan first writes a **plan** listing every copy, overwrite and deletion it intends to make. It changes nothing until you have reviewed that plan and told it to go ahead.
 
-> **Status: early development.** The commands below are the plan, not yet working features. Don't rely on syncplan for your only copy of anything yet.
+> **Status: early development.** Only `syncplan init` works so far; the other commands are the plan. Don't rely on syncplan for your only copy of anything yet.
 
 ## How it will work
 
-1. `syncplan init <backup>` marks a drive as a syncplan backup. Later runs refuse any destination without that marker, so a changed drive letter can't point a sync at the wrong disk.
-2. `syncplan plan` compares your configured source folders with the backup and writes a plan file. Nothing is modified.
+1. `syncplan init <backup> <sources>` marks a folder or drive as a syncplan backup of those source folders. Later runs refuse any destination without that marker, or whose marker doesn't list the source, so a changed drive letter can't point a sync at the wrong disk.
+2. `syncplan plan` compares your source folders with the backup and writes a plan file. Nothing is modified.
 3. You read the plan.
 4. `syncplan apply <plan>` carries out exactly that plan and nothing else.
 
 The backup becomes a mirror of your sources. Source folders are only ever read, never written. When a plan deletes or overwrites a file on the backup, the old copy is moved to a dated quarantine folder on the backup drive instead of being destroyed, so a mistaken sync can be undone.
+
+## Setting up a backup
+
+```
+usage: syncplan init [-h] BACKUP [SOURCE ...]
+```
+
+`BACKUP` is an existing folder, or a whole drive such as `E:`. Each `SOURCE` is a folder to back up, on any drive. Each source gets its own subfolder on the backup, named after the source folder:
+
+```
+> syncplan init E:\Backups C:\Photos D:\Work\Documents
+Measuring sources...
+Initialized syncplan backup at E:\Backups
+  Photos    <- C:\Photos             312 GB
+  Documents <- D:\Work\Documents      88 GB
+Space needed: about 400 GB. E:\ has 1.8 TB free.
+```
+
+- **Choosing a subfolder name.** Write `NAME=SOURCE`, for example `WorkDocs=D:\Documents`. You need it when two sources have the same folder name, or when a source is a whole drive.
+- **What init writes.** One small file, `E:\Backups\.syncplan\marker.json`, listing the source folders. Nothing is copied, and anything already in the backup folder is left as it is. A folder already named like a source, such as an old manual copy, becomes that source's mirror.
+- **What init refuses.** It writes nothing and exits with code 1 when:
+  - the backup folder doesn't exist, or is already a backup or inside one;
+  - a source doesn't exist, or is a syncplan backup;
+  - a source and the backup overlap, or two sources overlap;
+  - a subfolder name can't be used on Windows.
+- **Space.** It estimates the space needed and warns, without stopping, if the drive looks too small or would be left with less than 10% free.
+- **Redundancy.** You can back up the same sources to several drives: run `init` once per drive.
+- **Not a backup source.** syncplan's own folder, `C:\ProgramData\syncplan`, can't be one, so a whole `C:` drive is refused; back up its folders instead.
+
+## Logs
+
+Every run writes what it did, step by step, to a log file on your PC:
+
+```
+C:\ProgramData\syncplan\logs\syncplan.log
+```
+
+- **What it holds.** Each run gets a short run ID. The log records the syncplan, Python and Windows versions, the exact command, each check and its outcome, the sizes and timings measured, what was written, and how the run ended. For an error, it also holds the full technical details.
+- **On screen.** You see the normal messages; warnings and errors go to the error output. An error message ends with `Details:` and the log's location.
+- **Size.** When the log reaches 1 MB (1,048,576 bytes), the next run starts a new one. syncplan keeps the 5 previous logs (`syncplan.log.1` to `.5`), so they never take more than about 6 MB.
+- **Location.** `C:\ProgramData` is a hidden Windows folder outside your user folder, so backing up your files never includes the log.
+- **Real files only.** If `C:\ProgramData\syncplan`, a folder above it, or the log itself is a link to somewhere else, syncplan refuses to run. Otherwise its log could end up inside a folder you back up.
+- **One run at a time.** syncplan runs one command at a time on a PC. A second window is refused until the first one finishes.
+- **On a shared PC,** every Windows account on it can read the log, which holds folder names and commands.
+- **If you see "couldn't write the log"** after once running syncplan as administrator, that run made the log folder belong to administrators. Delete `C:\ProgramData\syncplan` from an administrator window, and the next normal run recreates it.
 
 ## Install
 
