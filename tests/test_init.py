@@ -1,13 +1,12 @@
 import json
 import os
-import re
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
 import pytest
-from conftest import make_tree, setup_folders
+from conftest import lists_source, make_tree, setup_folders
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
@@ -18,10 +17,6 @@ from syncplan.marker import Source, read_marker
 
 def sources_of(backup: Path) -> tuple[Source, ...]:
     return read_marker(backup).sources
-
-
-def lists_source(report: str, name: str, path: Path) -> bool:
-    return re.search(rf"^\s+{re.escape(name)}\s+<- {re.escape(str(path))}(\s|$)", report, re.M)
 
 
 # R1 Initialize a backup

@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
-from conftest import make_backup, make_tree, tree_snapshot
+from conftest import lists_source, make_backup, make_tree, marker_names, tree_snapshot
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
@@ -16,16 +16,13 @@ from syncplan import cli, init, marker, space
 from syncplan.marker import Source, read_marker
 
 MARKER = ".syncplan/marker.json"
+EDITED = json.dumps(  # a marker edited by hand while a command runs (R6.3)
+    {"syncplan_marker": 1, "created": "2026-10-08T16:40:00+02:00", "sources": []}
+)
 
 
 def marker_file(backup: Path) -> Path:
     return backup / ".syncplan" / "marker.json"
-
-
-def lists_source(report: str, name: str, path: Path) -> bool:
-    return bool(
-        re.search(rf"^\s+{re.escape(name)}\s+<- {re.escape(str(path))}(\s|$)", report, re.M)
-    )
 
 
 def refused(result, *expected: str) -> str:
@@ -38,9 +35,9 @@ def refused(result, *expected: str) -> str:
     return err
 
 
-def same_but_marker(before: dict, after: dict, backup: str = "backup") -> bool:
+def same_but_marker(before: dict, after: dict) -> bool:
     """R6.4: every file and folder is as before, apart from the backup's marker."""
-    key = f"{backup}/{MARKER}"
+    key = f"backup/{MARKER}"
     return {k: v for k, v in before.items() if k != key} == {
         k: v for k, v in after.items() if k != key
     }
@@ -60,6 +57,16 @@ def hand_written(backup: Path, sources, waiting=()) -> Path:
         ]
     make_tree(backup, {MARKER: json.dumps(data)})
     return marker_file(backup)
+
+
+def full_disk(fd):
+    """Stands in for os.fsync: the backup drive is full, so saving fails (R6.2)."""
+    raise OSError(28, "There is not enough space on the disk")
+
+
+def _named_pair(pairs, name: str):
+    """The (name, path) pair with this name, ignoring letter case, or None."""
+    return next((pair for pair in pairs if pair[0].lower() == name.lower()), None)
 
 
 @pytest.fixture
@@ -113,7 +120,7 @@ def test_r1_2_report_shows_the_added_sources_then_the_full_list(tmp_path, run_cl
     assert code == 0
     added, _, now = out.partition(f"Sources of {backup} now:\n")
     assert f"Added to syncplan backup {backup}:" in added
-    assert lists_source(added, "Music", music)
+    assert re.search(rf"^  Music <- {re.escape(str(music))}  4\.0 KB$", added, re.M)
     assert not lists_source(added, "Photos", photos)
     assert lists_source(now, "Photos", photos)
     assert lists_source(now, "Music", music)
@@ -406,9 +413,6 @@ def test_r6_2_a_failed_save_gives_the_reason_and_keeps_the_marker(
     backup, _ = make_backup(run_cli, tmp_path, "Photos")
     before = tree_snapshot(tmp_path)
 
-    def full_disk(fd):
-        raise OSError(28, "There is not enough space on the disk")
-
     monkeypatch.setattr(marker.os, "fsync", full_disk)
 
     code, _, err = run_cli("add", backup, music)
@@ -422,13 +426,10 @@ def test_r6_2_a_failed_save_gives_the_reason_and_keeps_the_marker(
 
 def test_r6_3_a_marker_changed_while_measuring_is_kept(tmp_path, run_cli, music, monkeypatch):
     backup, _ = make_backup(run_cli, tmp_path, "Photos")
-    edited = json.dumps(
-        {"syncplan_marker": 1, "created": "2026-10-08T16:40:00+02:00", "sources": []}
-    )
     real = space.folder_size
 
     def edited_meanwhile(folder, block):
-        marker_file(backup).write_text(edited)
+        marker_file(backup).write_text(EDITED)
         return real(folder, block)
 
     monkeypatch.setattr(space, "folder_size", edited_meanwhile)
@@ -438,8 +439,8 @@ def test_r6_3_a_marker_changed_while_measuring_is_kept(tmp_path, run_cli, music,
     assert code == 1
     assert f"The source list of {backup} changed while syncplan was running" in err
     assert "Details:" not in err
-    assert marker_file(backup).read_text() == edited
-    assert sorted(p.name for p in marker_file(backup).parent.iterdir()) == ["marker.json"]
+    assert marker_file(backup).read_text() == EDITED
+    assert marker_names(backup) == ["marker.json"]
 
 
 def test_r6_4_add_changes_nothing_but_the_marker(tmp_path, run_cli, music):
@@ -579,12 +580,14 @@ def test_r2_2_report_shows_the_removed_sources_their_fate_and_the_full_list(run_
 
 def test_r2_3_removing_the_last_source_keeps_a_backup_with_none(tmp_path, run_cli):
     backup, _ = make_backup(run_cli, tmp_path, "Photos")
+    before = tree_snapshot(tmp_path)
 
     code, out, _ = run_cli("remove", backup, "Photos")
 
     assert code == 0
     assert read_marker(backup).sources == ()
     assert f"Sources of {backup} now:\n  (no sources)\n" in out
+    assert same_but_marker(before, tree_snapshot(tmp_path))
 
 
 def test_r2_4_a_name_that_is_not_listed_refuses_everything(run_cli, three, tmp_path):
@@ -611,12 +614,28 @@ def test_r2_4_a_listed_folder_given_instead_of_its_name_gets_the_name(run_cli, t
 
 
 def test_r2_4_a_bare_drive_given_instead_of_its_name_gets_the_name(tmp_path, run_cli, monkeypatch):
-    # D5: "C:" means C:\, not the current folder on C: (init-marker D8).
+    # D5: "X:" means X:\, not the current folder on X: (init-marker D8). The drive is the
+    # temporary folder's own, so changing into that folder really moves X:'s current folder.
+    drive = tmp_path.drive
     backup = tmp_path / "backup"
-    hand_written(backup, [("DriveC", "C:\\")])
+    hand_written(backup, [("Drive", f"{drive}\\")])
     monkeypatch.chdir(tmp_path)
 
-    refused(run_cli("remove", backup, "C:"), "C:\\ is listed as DriveC")
+    refused(run_cli("remove", backup, drive), f"{drive}\\ is listed as Drive")
+
+
+def test_r2_4_a_network_path_given_as_a_name_is_never_looked_up(run_cli, three, monkeypatch):
+    # D5: resolving \\nas\photos would contact that server; add refuses such paths unread.
+    backup, _ = three
+    real = Path.resolve
+
+    def resolve(self, *args, **kwargs):
+        assert not str(self).startswith("\\\\"), f"looked up {self}"
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+
+    refused(run_cli("remove", backup, "\\\\nas\\photos"), 'has no source named "\\\\nas\\photos"')
 
 
 def test_r2_4_a_folder_that_is_not_listed_gets_the_list(run_cli, three, tmp_path):
@@ -632,6 +651,14 @@ def test_r2_5_the_same_name_twice_is_refused(run_cli, three, tmp_path):
     refused(run_cli("remove", backup, "Photos", "Photos"), '"Photos" is given twice.')
 
     assert tree_snapshot(tmp_path) == before
+
+
+def test_r2_5_a_repeated_name_is_reported_before_an_unknown_one(run_cli, three):
+    # D6: duplicates are checked first, whether or not the name is listed.
+    backup, _ = three
+
+    refused(run_cli("remove", backup, "Musik", "Musik"), '"Musik" is given twice.')
+    refused(run_cli("remove", backup, "Photos", "Musik", "photos"), '"photos" is given twice.')
 
 
 # R3 Folders waiting for the quarantine
@@ -652,8 +679,9 @@ def test_r3_1_a_removed_source_with_a_copy_waits_and_its_folder_is_untouched(
     assert same_but_marker(before, tree_snapshot(tmp_path))
 
 
-def test_r3_2_a_removed_source_without_a_copy_leaves_nothing_waiting(run_cli, three):
+def test_r3_2_a_removed_source_without_a_copy_leaves_nothing_waiting(run_cli, three, tmp_path):
     backup, _ = three
+    before = tree_snapshot(tmp_path)
 
     code, out, _ = run_cli("remove", backup, "Docs")
 
@@ -661,6 +689,7 @@ def test_r3_2_a_removed_source_without_a_copy_leaves_nothing_waiting(run_cli, th
     assert read_marker(backup).waiting == ()
     assert "held no copy of Docs" in out
     assert "Waiting for the quarantine" not in out
+    assert same_but_marker(before, tree_snapshot(tmp_path))
 
 
 def test_r3_3_adding_a_removed_source_back_keeps_its_copy(run_cli, three, tmp_path):
@@ -682,11 +711,12 @@ def test_r3_3_adding_a_removed_source_back_keeps_its_copy(run_cli, three, tmp_pa
     assert same_but_marker(before, tree_snapshot(tmp_path))
 
 
-def test_r3_3_adding_back_after_the_copy_was_deleted_by_hand(run_cli, three):
+def test_r3_3_adding_back_after_the_copy_was_deleted_by_hand(run_cli, three, tmp_path):
     backup, (photos, _, _) = three
     run_cli("remove", backup, "Photos")
     (backup / "Photos" / "a.jpg").unlink()
     (backup / "Photos").rmdir()
+    before = tree_snapshot(tmp_path)
 
     code, out, _ = run_cli("add", backup, photos)
 
@@ -696,6 +726,17 @@ def test_r3_3_adding_back_after_the_copy_was_deleted_by_hand(run_cli, three):
     assert found.sources[-1] == Source("Photos", photos.resolve())
     assert "was waiting" not in out
     assert "already exists" not in out
+    assert same_but_marker(before, tree_snapshot(tmp_path))
+
+
+def test_r3_3_taking_one_back_keeps_the_other_waiting_folders(run_cli, three):
+    backup, (photos, _, _) = three
+    run_cli("remove", backup, "Photos", "Music")
+    music_waiting = read_marker(backup).waiting[1]
+
+    assert run_cli("add", backup, photos)[0] == 0
+
+    assert read_marker(backup).waiting == (music_waiting,)
 
 
 def test_r3_4_another_folder_cannot_take_a_waiting_name(run_cli, three, tmp_path):
@@ -746,16 +787,75 @@ def test_r3_5_a_link_where_the_copy_would_be_is_refused(tmp_path, run_cli, junct
     refused(run_cli("remove", backup, "Photos"), "is not a real folder")
 
 
-def test_r3_5_a_copy_whose_path_is_too_long_to_check_is_refused(tmp_path, run_cli):
-    # SP6: Windows reports such a folder as missing even when it exists.
+def long_name(backup: Path, units: int, emoji: bool = False) -> str:
+    """A NAME that makes <backup>\\<name> exactly `units` UTF-16 units long, as Windows counts.
+
+    With emoji, the name starts with a camera emoji: one character, but two units.
+    """
+    rest = units - len(str(backup)) - 1
+    name = "\U0001f4f7" + "N" * (rest - 2) if emoji else "N" * rest
+    assert len(f"{backup}\\{name}".encode("utf-16-le")) // 2 == units
+    return name
+
+
+@pytest.mark.parametrize("emoji", [False, True])
+def test_r3_5_a_copy_whose_path_is_too_long_to_check_is_refused(tmp_path, run_cli, emoji):
+    # SP6: Windows reports such a folder as missing even when it exists. With the emoji
+    # the path is 259 characters to Python but 260 to Windows.
     backup = tmp_path / "backup"
-    long_name = "N" * (260 - len(str(backup)))
-    assert len(long_name) <= 255
-    hand_written(backup, [(long_name, tmp_path / "src" / "Long")])
+    name = long_name(backup, 260, emoji)
+    hand_written(backup, [(name, tmp_path / "src" / "Long")])
     before = tree_snapshot(tmp_path)
 
-    refused(run_cli("remove", backup, long_name), "260 characters or more", "then run remove again")
+    refused(run_cli("remove", backup, name), "260 characters or more", "then run remove again")
 
+    assert tree_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("emoji", [False, True])
+def test_r5_6_a_name_that_makes_the_copy_path_too_long_is_refused(tmp_path, run_cli, music, emoji):
+    backup, _ = make_backup(run_cli, tmp_path, "Photos")
+    before = tree_snapshot(tmp_path)
+
+    refused(
+        run_cli("add", backup, f"{long_name(backup, 260, emoji)}={music}"),
+        "would be a path of 260 characters or more, too long for syncplan.",
+        "Pick a shorter name with NAME=SOURCE.",
+    )
+
+    assert tree_snapshot(tmp_path) == before
+
+
+def test_r5_6_a_copy_path_just_under_the_limit_is_accepted(tmp_path, run_cli, music):
+    backup, _ = make_backup(run_cli, tmp_path, "Photos")
+
+    assert run_cli("add", backup, f"{long_name(backup, 259)}={music}")[0] == 0
+
+
+def test_d11_a_backup_gone_while_its_copies_are_looked_at_stops_the_run(
+    run_cli, three, tmp_path, monkeypatch
+):
+    # The drive is pulled between reading the marker and looking at the subfolder (SP6).
+    backup, _ = three
+    before = tree_snapshot(tmp_path)
+    real_lstat, real_stat = Path.lstat, Path.stat
+
+    def gone(path):
+        raise FileNotFoundError(3, "The system cannot find the path specified", str(path))
+
+    monkeypatch.setattr(
+        Path, "lstat", lambda self: gone(self) if self.parent == backup else real_lstat(self)
+    )
+    monkeypatch.setattr(
+        Path, "stat", lambda self, **kw: gone(self) if self == backup else real_stat(self, **kw)
+    )
+
+    code, _, err = run_cli("remove", backup, "Photos")
+
+    monkeypatch.undo()
+    assert code == 1
+    assert f"{backup}: The system cannot find the path specified." in err
+    assert "Details:" in err
     assert tree_snapshot(tmp_path) == before
 
 
@@ -812,9 +912,6 @@ def test_r6_2_remove_that_cannot_save_keeps_the_marker(run_cli, three, tmp_path,
     backup, _ = three
     before = tree_snapshot(tmp_path)
 
-    def full_disk(fd):
-        raise OSError(28, "There is not enough space on the disk")
-
     monkeypatch.setattr(marker.os, "fsync", full_disk)
 
     code, _, err = run_cli("remove", backup, "Photos")
@@ -827,14 +924,11 @@ def test_r6_2_remove_that_cannot_save_keeps_the_marker(run_cli, three, tmp_path,
 
 def test_r6_3_remove_keeps_a_marker_changed_meanwhile(run_cli, three, monkeypatch):
     backup, _ = three
-    edited = json.dumps(
-        {"syncplan_marker": 1, "created": "2026-10-08T16:40:00+02:00", "sources": []}
-    )
     real = Path.lstat
 
     def edited_meanwhile(self):
         if self.name == "Photos":
-            marker_file(backup).write_text(edited)
+            marker_file(backup).write_text(EDITED)
         return real(self)
 
     monkeypatch.setattr(Path, "lstat", edited_meanwhile)
@@ -843,7 +937,7 @@ def test_r6_3_remove_keeps_a_marker_changed_meanwhile(run_cli, three, monkeypatc
 
     assert code == 1
     assert "changed while syncplan was running" in err
-    assert marker_file(backup).read_text() == edited
+    assert marker_file(backup).read_text() == EDITED
 
 
 # NFR1 and NFR2 for remove
@@ -891,7 +985,7 @@ _NAMES = ["Photos", "Docs", "Music"]
 _STEPS = st.lists(
     st.tuples(
         st.sampled_from(["remove", "add back", "new name", "taken name", "delete copy"]),
-        st.integers(0, len(_NAMES) - 1),
+        st.lists(st.sampled_from(_NAMES), min_size=1, max_size=3, unique=True),
         st.booleans(),
     ),
     min_size=1,
@@ -899,9 +993,22 @@ _STEPS = st.lists(
 )
 
 
+def _expected_add(listed, waiting, typed: str, path: Path) -> bool:
+    """The model of add (R5.2, R5.4, R3.3, R3.4): True if it succeeds; updates the lists."""
+    if any(p == path for _, p in listed) or _named_pair(listed, typed):
+        return False
+    if (old := _named_pair(waiting, typed)) is not None:
+        if old[1] != path:
+            return False
+        waiting.remove(old)
+    listed.append((typed, path))
+    return True
+
+
 @settings(max_examples=25, deadline=None)
 @given(_STEPS, st.lists(st.booleans(), min_size=3, max_size=3))
-def test_r3_property_listed_and_waiting_names_never_overlap(steps, has_copy):
+def test_r3_property_add_and_remove_follow_the_model(steps, has_copy):
+    """Every step's exit code and lists match a model of R2, R3.1-R3.4 and R5.2-R5.4."""
     with tempfile.TemporaryDirectory() as folder:
         root = Path(folder).resolve()
         tree = {f"src/{n}/{n}.txt": n for n in _NAMES} | {"backup": None, "other/x": "x"}
@@ -912,34 +1019,33 @@ def test_r3_property_listed_and_waiting_names_never_overlap(steps, has_copy):
         backup, src = root / "backup", {n: root / "src" / n for n in _NAMES}
         assert cli.main(["init", str(backup), *map(str, src.values())]) == 0
         created = read_marker(backup).created
-        for step, index, upper in steps:
-            name = _NAMES[index]
-            typed = name.upper() if upper else name
+        listed = [(n, src[n]) for n in _NAMES]  # the model: (name, path) pairs
+        waiting: list[tuple[str, Path]] = []
+        for step, names, upper in steps:
+            typed = [n.upper() if upper else n for n in names]
             before = read_marker(backup)
             if step == "delete copy":
-                if _named(before.waiting, name) and (backup / name).exists():
-                    shutil.rmtree(backup / name)
+                if _named_pair(waiting, names[0]) and (backup / names[0]).exists():
+                    shutil.rmtree(backup / names[0])
                 continue
-            argument = {
-                "remove": typed,
-                "add back": f"{typed}={src[name]}",
-                "new name": f"{name}Again={src[name]}",
-                "taken name": f"{typed}={root / 'other'}",
-            }[step]
-            code = cli.main(["remove" if step == "remove" else "add", str(backup), argument])
+            if step == "remove":
+                code = cli.main(["remove", str(backup), *typed])
+                removed = [_named_pair(listed, n) for n in typed]
+                ok = all(removed)
+                if ok:
+                    for pair in removed:
+                        listed.remove(pair)
+                        if (backup / pair[0]).is_dir():  # R3.1, else R3.2
+                            waiting.append(pair)
+            else:
+                path = {"taken name": root / "other"}.get(step, src[names[0]])
+                name = f"{names[0]}Again" if step == "new name" else typed[0]
+                code = cli.main(["add", str(backup), f"{name}={path}"])
+                ok = _expected_add(listed, waiting, name, path)
             after = read_marker(backup)
-            assert code in (0, 1)
-            if code == 1:
+            assert code == (0 if ok else 1), (step, typed)
+            if not ok:
                 assert after.raw == before.raw
-            listed = {s.name.lower() for s in after.sources}
-            assert not listed & {w.name.lower() for w in after.waiting}
+            assert [(s.name, s.path) for s in after.sources] == listed
+            assert [(w.name, w.path) for w in after.waiting] == waiting
             assert after.created == created
-            for gone in set(before.waiting) - set(after.waiting):  # only R3.3 takes one back
-                assert any(
-                    s.name.lower() == gone.name.lower() and s.path == gone.path
-                    for s in after.sources
-                )
-
-
-def _named(items, name: str):
-    return next((item for item in items if item.name.lower() == name.lower()), None)

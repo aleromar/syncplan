@@ -39,7 +39,7 @@ class Marker:
     created: datetime
     sources: tuple[Source, ...]
     waiting: tuple[Waiting, ...] = ()
-    raw: bytes = field(default=b"", compare=False, repr=False)  # the file as read (design D2)
+    raw: bytes = field(default=b"", compare=False, repr=False)  # as read (manage-sources D2)
 
 
 class MarkerError(Exception):
@@ -62,7 +62,8 @@ class MarkerChanged(MarkerError):
     pass
 
 
-def _marker_path(folder: Path) -> Path:
+def marker_path(folder: Path) -> Path:
+    """Where the folder's marker is, whether or not it exists."""
     return folder / MARKER_DIR / MARKER_NAME
 
 
@@ -73,7 +74,7 @@ def has_marker(folder: Path) -> bool:
     can't be checked must not pass for no marker.
     """
     try:
-        _marker_path(folder).stat()
+        marker_path(folder).stat()
     except FileNotFoundError, NotADirectoryError:
         return False
     return True
@@ -81,7 +82,7 @@ def has_marker(folder: Path) -> bool:
 
 def read_marker(folder: Path) -> Marker:
     """The marker check: the folder's marker, or a MarkerError saying why there is none."""
-    path = _marker_path(folder)
+    path = marker_path(folder)
     unreadable = UnreadableMarker(f"{path} can't be read; inspect it.")
     try:
         raw = path.read_bytes()
@@ -132,14 +133,14 @@ def write_marker(folder: Path, sources: Sequence[Source]) -> Marker:
     own_dir = folder / MARKER_DIR
     created_dir = not own_dir.exists()
     own_dir.mkdir(exist_ok=True)
-    _swap_in(own_dir, data, lambda temp: temp.rename(_marker_path(folder)), created_dir)
-    logger.debug("marker written: %s", _marker_path(folder))
+    _swap_in(own_dir, data, lambda temp: temp.rename(marker_path(folder)), created_dir)
+    logger.debug("marker written: %s", marker_path(folder))
     return marker
 
 
 def replace_marker(
     folder: Path, old: Marker, sources: Sequence[Source], waiting: Sequence[Waiting]
-) -> Marker:
+) -> None:
     """Replace the folder's marker, read earlier as old, with new lists (manage-sources D2, D3).
 
     Every other field of the marker is kept, and so is the original entry of every source
@@ -153,14 +154,14 @@ def replace_marker(
     data["to_quarantine"] = _keep_originals(data.get("to_quarantine", []), entries)
     if not data["to_quarantine"]:
         del data["to_quarantine"]
-    target = _marker_path(folder)
+    target = marker_path(folder)
 
-    def swap(temp: Path) -> None:
-        # Checked after the slow fsync, right before the swap, to keep the gap small (K3).
+    def check_then_replace(temp: Path) -> None:
+        # Checked right before the swap, after the slow fsync (manage-sources K3).
         try:
             current = target.read_bytes()
         except FileNotFoundError:
-            target.parent.stat()  # the drive itself gone? Then that is the error (SP6)
+            target.parent.stat()  # the drive gone? That is the error (manage-sources SP6)
             current = None
         if current != old.raw:
             raise MarkerChanged(
@@ -169,16 +170,15 @@ def replace_marker(
             )
         temp.replace(target)
 
-    text = _swap_in(target.parent, data, swap, created_dir=False)
+    _swap_in(target.parent, data, check_then_replace, created_dir=False)
     logger.debug("marker replaced: %s", target)
-    return Marker(old.created, tuple(sources), tuple(waiting), text.encode("ascii"))
 
 
-def _swap_in(own_dir: Path, data: dict, swap: Callable[[Path], None], created_dir: bool) -> str:
+def _swap_in(own_dir: Path, data: dict, swap: Callable[[Path], None], created_dir: bool) -> None:
     """Write data to a new temporary file in own_dir, flushed and closed, then swap it in.
 
     If anything fails, the temporary file, and own_dir if this write created it, are
-    removed when possible (R1.6, manage-sources R6.2). Returns the text written.
+    removed when possible (R1.6, manage-sources R6.2).
     """
     text = json.dumps(data, indent=2) + "\n"
     temp, done = None, False
@@ -189,12 +189,11 @@ def _swap_in(own_dir: Path, data: dict, swap: Callable[[Path], None], created_di
             file.write(text)
             file.flush()
             os.fsync(file.fileno())
-        swap(temp)  # only once the file is closed: an open one can't be renamed (SP4)
+        swap(temp)  # only once closed: an open file can't be renamed (manage-sources SP4)
         done = True
     finally:
         if not done:
             _clean_up([temp] + ([own_dir] if created_dir else []))
-    return text
 
 
 def _clean_up(leftovers: list[Path | None]) -> None:
@@ -216,7 +215,7 @@ def _clean_up(leftovers: list[Path | None]) -> None:
 
 
 def _parse(raw: bytes) -> dict:
-    """The marker's JSON. A byte-order mark is allowed, so a copy saved by Notepad reads (D12)."""
+    """The marker's JSON. A byte-order mark is fine: Notepad may add one (init-marker D12)."""
     return json.loads(raw.decode("utf-8-sig"))
 
 
@@ -225,7 +224,7 @@ def _source_entry(source: Source | Waiting) -> dict:
 
 
 def _keep_originals(before: list[dict], after: list[dict]) -> list[dict]:
-    """The after entries, each replaced by its original object if it was there before (D3)."""
+    """The after entries, each kept as its original object if it was there (manage-sources D3)."""
     originals = {(item["name"], str(Path(item["path"]))): item for item in before}
     return [originals.get((entry["name"], entry["path"]), entry) for entry in after]
 

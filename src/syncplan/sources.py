@@ -25,13 +25,13 @@ from syncplan.init import (
 )
 from syncplan.marker import (
     MARKER_DIR,
-    MARKER_NAME,
     Marker,
     MarkerChanged,
     MarkerError,
     NotInitialized,
     Source,
     Waiting,
+    marker_path,
     read_marker,
     replace_marker,
 )
@@ -39,7 +39,6 @@ from syncplan.space import format_size
 
 logger = logging.getLogger(__name__)
 _TOO_LONG = 260  # Windows' path limit while long paths are off (SP6); longer paths are F8's
-_REPARSE_POINT = stat.FILE_ATTRIBUTE_REPARSE_POINT  # a symbolic link or a junction
 
 
 @dataclass(frozen=True)
@@ -54,21 +53,20 @@ class Addition:
 def check_add(backup: str, arguments: Sequence[str]) -> Addition:
     """Steps 1-5 of add: refuse anything unsafe before measuring. Nothing is written."""
     backup_dir = backup_folder(backup, "add")
-    current = _read(backup_dir)
+    current = _checked_marker(backup_dir)
     added, adopted = check_sources(backup_dir, arguments, "add")
     for source in added:
-        _check_against_listed(source, current.sources, backup_dir)
-    reclaimed = []
-    for source in added:
-        if (old := _named(current.waiting, source.name)) is None:
-            continue
-        if old.path != source.path:
+        if _too_long(backup_dir / source.name):  # remove could never take it off (R3.5)
             raise Refusal(
-                f"{backup_dir / old.name} holds the old copy of {old.path} and is waiting for"
-                " the quarantine. Pick another name, for example"
-                f" {quoted(f'{source.name}2={source.path}')}, or apply a plan first."
+                f"{backup_dir / source.name} would be a path of {_TOO_LONG} characters or more,"
+                " too long for syncplan. Pick a shorter name with NAME=SOURCE."
             )
-        reclaimed.append(old)
+        _check_against_listed(source, current.sources, backup_dir)
+    reclaimed = [
+        entry
+        for source in added
+        if (entry := _check_against_waiting(source, current.waiting, backup_dir)) is not None
+    ]
     logger.debug("listed sources and waiting folders: ok")
     return Addition(backup_dir, current, added, adopted, tuple(reclaimed))
 
@@ -87,7 +85,7 @@ def finish_add(addition: Addition) -> None:
         folder = backup / source.name
         if folder not in addition.adopted:
             continue
-        if _named(addition.reclaimed, source.name):
+        if _named(addition.reclaimed, source.name) is not None:
             logger.info(
                 "%s was waiting for the quarantine; it is kept and backs up %s again.",
                 folder,
@@ -109,11 +107,14 @@ def finish_add(addition: Addition) -> None:
 def remove(backup: str, names: Sequence[str]) -> None:
     """Steps 1-6 of remove (R2, R3). Nothing is written until every check has passed."""
     backup_dir = backup_folder(backup, "remove")
-    current = _read(backup_dir)
+    current = _checked_marker(backup_dir)
+    seen: set[str] = set()
+    for name in names:  # a repeat first, listed or not (D6)
+        if name.lower() in seen:
+            raise Refusal(f'"{name}" is given twice.')
+        seen.add(name.lower())
     removed: list[Source] = []
     for name in names:
-        if _named(removed, name) is not None:
-            raise Refusal(f'"{name}" is given twice.')
         if (source := _named(current.sources, name)) is None:
             raise Refusal(_not_listed(name, backup_dir, current.sources))
         removed.append(source)
@@ -141,7 +142,7 @@ def remove(backup: str, names: Sequence[str]) -> None:
     _report_list(backup_dir, sources, waiting)
 
 
-def _read(backup_dir: Path) -> Marker:
+def _checked_marker(backup_dir: Path) -> Marker:
     """Step 2: the backup's marker (R4.2, R4.3), with every name in it usable (D12)."""
     try:
         current = read_marker(backup_dir)
@@ -151,8 +152,9 @@ def _read(backup_dir: Path) -> Marker:
             f" Set it up first with syncplan init {quoted(str(backup_dir))}."
         ) from None
     except MarkerError as error:
-        raise Refusal(str(error)) from error  # an OS error behind it gets Details (R5.2)
-    path = backup_dir / MARKER_DIR / MARKER_NAME
+        # An OS error behind it gets Details (init-marker R5.2).
+        raise Refusal(str(error)) from error
+    path = marker_path(backup_dir)
     seen: set[str] = set()
     for item in (*current.sources, *current.waiting):
         try:
@@ -175,25 +177,41 @@ def _read(backup_dir: Path) -> Marker:
 
 def _check_against_listed(source: Source, listed: Sequence[Source], backup_dir: Path) -> None:
     """R5.2-R5.4: a new source must not repeat, nest with, or take the name of a listed one."""
-    for old in listed:
-        where = f"already a source of {backup_dir} (as {old.name})"
-        if source.path == old.path:
+    for listed_source in listed:
+        where = f"already a source of {backup_dir} (as {listed_source.name})"
+        if source.path == listed_source.path:
             raise Refusal(f"{source.path} is {where}.")
-        if source.path.is_relative_to(old.path):
-            raise Refusal(f"{source.path} is inside {old.path}, {where}.")
-        if old.path.is_relative_to(source.path):
-            raise Refusal(f"{source.path} holds {old.path}, {where}.")
-    if (old := _named(listed, source.name)) is not None:
+        if source.path.is_relative_to(listed_source.path):
+            raise Refusal(f"{source.path} is inside {listed_source.path}, {where}.")
+        if listed_source.path.is_relative_to(source.path):
+            raise Refusal(f"{source.path} holds {listed_source.path}, {where}.")
+    if (same_name := _named(listed, source.name)) is not None:
         raise Refusal(
-            f'{backup_dir} already has a source named "{old.name}" ({old.path}).'
+            f'{backup_dir} already has a source named "{same_name.name}" ({same_name.path}).'
             f" Name the new one, for example {quoted(f'{source.name}2={source.path}')}"
         )
 
 
+def _check_against_waiting(
+    source: Source, waiting: Sequence[Waiting], backup_dir: Path
+) -> Waiting | None:
+    """R3.3, R3.4: the waiting folder this source takes back, if any; another source can't."""
+    if (entry := _named(waiting, source.name)) is None:
+        return None
+    if entry.path != source.path:
+        raise Refusal(
+            f"{backup_dir / entry.name} holds the old copy of {entry.path} and is waiting for"
+            " the quarantine. Pick another name, for example"
+            f" {quoted(f'{source.name}2={source.path}')}, or apply a plan first."
+        )
+    return entry
+
+
 def _not_listed(name: str, backup_dir: Path, sources: Sequence[Source]) -> str:
     """R2.4's refusal. A listed folder given instead of its name gets that name (D5)."""
-    if any(char in name for char in "\\/:"):
-        path = read_argument(name)[1].resolve()  # read as add reads it: E: means E:\ (D8)
+    # A \\ path is never looked up: that would contact a network server (init-marker R3.8).
+    if any(char in name for char in "\\/:") and not name.startswith(("\\\\", "//")):
+        path = read_argument(name)[1].resolve()  # as add reads it: E: is E:\ (init-marker D8)
         for source in sources:
             if source.path == path:
                 return (
@@ -212,9 +230,10 @@ def _has_copy(folder: Path, backup_dir: Path) -> bool:
     "missing" (SP6), and the old copy would then drop off the record.
     """
     move = f"Move it out of {backup_dir}, then run remove again."
-    if len(str(folder)) >= _TOO_LONG:
+    if _too_long(folder):
         raise Refusal(
-            f"{folder} is a path of 260 characters or more, too long for syncplan to check. {move}"
+            f"{folder} is a path of {_TOO_LONG} characters or more,"
+            f" too long for syncplan to check. {move}"
         )
     try:
         info = folder.lstat()
@@ -222,10 +241,18 @@ def _has_copy(folder: Path, backup_dir: Path) -> bool:
         backup_dir.stat()  # the backup drive itself gone? Then that error ends the run (SP6)
         logger.debug("subfolder %s: missing, so nothing waits", folder)
         return False
-    if stat.S_ISDIR(info.st_mode) and not info.st_file_attributes & _REPARSE_POINT:
+    if (
+        stat.S_ISDIR(info.st_mode)
+        and not info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    ):
         logger.debug("subfolder %s: a plain folder, waiting for the quarantine", folder)
         return True
     raise Refusal(f"{folder} is not a real folder, so it can't wait for the quarantine. {move}")
+
+
+def _too_long(path: Path) -> bool:
+    """R3.5, R5.6: 260 or more UTF-16 units, as Windows counts a path (an emoji is two)."""
+    return len(str(path).encode("utf-16-le")) // 2 >= _TOO_LONG
 
 
 def _save(

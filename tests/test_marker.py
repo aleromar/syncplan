@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
-from conftest import make_tree
+from conftest import make_tree, marker_names
 from hypothesis import example, given
 from hypothesis import strategies as st
 
@@ -278,10 +278,6 @@ def test_r1_6_backup_folder_that_vanished_is_not_recreated(tmp_path):
 
 REMOVED = "2026-10-12T10:15:00+02:00"
 WAITING = {"name": "Old", "path": "C:\\Old", "removed": REMOVED}
-
-
-def marker_names(folder: Path) -> list[str]:
-    return sorted(p.name for p in (folder / ".syncplan").iterdir())
 
 
 def test_r3_1_waiting_folders_read_back_as_written(tmp_path):

@@ -12,6 +12,7 @@ from typing import IO
 from syncplan import init, log, sources
 
 logger = logging.getLogger(__name__)
+_SOURCE_HELP = "folder to back up; write NAME=SOURCE to choose its subfolder name"
 
 
 class _Parser(argparse.ArgumentParser):
@@ -103,7 +104,7 @@ def _parser() -> argparse.ArgumentParser:
         "sources",
         metavar="SOURCE",
         nargs="*",
-        help="folder to back up; write NAME=SOURCE to choose its subfolder name",
+        help=_SOURCE_HELP,
     )
     add_parser = commands.add_parser(
         "add",
@@ -116,7 +117,7 @@ def _parser() -> argparse.ArgumentParser:
         "sources",
         metavar="SOURCE",
         nargs="+",
-        help="folder to back up; write NAME=SOURCE to choose its subfolder name",
+        help=_SOURCE_HELP,
     )
     remove_parser = commands.add_parser(
         "remove",

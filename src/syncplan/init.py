@@ -32,7 +32,7 @@ _FREE_SHARE = 10  # warn when less than 1/10 of the drive would be left (R2.7)
 
 
 class Refusal(Exception):
-    """init won't go ahead. The message says why and is meant for the user."""
+    """The command won't go ahead. The message says why and is meant for the user."""
 
 
 @dataclass(frozen=True)

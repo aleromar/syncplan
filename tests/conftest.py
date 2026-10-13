@@ -3,6 +3,7 @@
 import ctypes
 import msvcrt
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -66,6 +67,18 @@ def tree_snapshot(root: Path) -> dict[str, object]:
             else:
                 snapshot[key] = path.read_bytes()
     return snapshot
+
+
+def lists_source(report: str, name: str, path: Path) -> bool:
+    """True if report has an aligned `NAME <- SOURCE` line for this source."""
+    return bool(
+        re.search(rf"^\s+{re.escape(name)}\s+<- {re.escape(str(path))}(\s|$)", report, re.M)
+    )
+
+
+def marker_names(folder: Path) -> list[str]:
+    """What is in the folder's .syncplan: the marker, and any temporary file left behind."""
+    return sorted(p.name for p in (folder / ".syncplan").iterdir())
 
 
 def make_backup(run_cli, tmp_path: Path, *names: str) -> tuple[Path, list[Path]]:
