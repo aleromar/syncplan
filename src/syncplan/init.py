@@ -53,10 +53,31 @@ def read_argument(text: str) -> tuple[str | None, Path]:
 
 def check_init(backup: str, sources: Sequence[str]) -> Setup:
     """Steps 1-4: resolve every path, then refuse anything unsafe. Nothing is written."""
-    backup_dir = _resolve(_bare_drive(Path(backup)))
+    backup_dir = backup_folder(backup)
     _check_backup(backup_dir)
     logger.debug("backup %s: ok (exists, no marker, no backup above)", backup_dir)
-    given = [(name, _resolve(path)) for name, path in map(read_argument, sources)]
+    named, adopted = check_sources(backup_dir, sources)
+    return Setup(backup_dir, named, adopted)
+
+
+def backup_folder(text: str) -> Path:
+    """R2.1, R2.9 and R2.10: the backup folder, resolved. Refuses a missing or exotic one."""
+    backup_dir = _resolve(_bare_drive(Path(text)))
+    _check_folder(backup_dir)
+    own = backup_dir / MARKER_DIR
+    if own.is_symlink() or own.is_junction() or (own.exists() and not own.is_dir()):
+        raise Refusal(f"{own} is not a real folder. Remove it, or choose another backup folder.")
+    return backup_dir
+
+
+def check_sources(
+    backup_dir: Path, arguments: Sequence[str]
+) -> tuple[tuple[Source, ...], tuple[Path, ...]]:
+    """Steps 3-4 for each SOURCE or NAME=SOURCE (R3.1-R3.9). Nothing is written.
+
+    Returns the sources, named, and the folders already on the backup they adopt (R1.5).
+    """
+    given = [(name, _resolve(path)) for name, path in map(read_argument, arguments)]
     for _, path in given:
         _check_source(path, backup_dir)
         logger.debug("source %s: exists, not syncplan's or a backup, apart from the backup", path)
@@ -70,7 +91,7 @@ def check_init(backup: str, sources: Sequence[str]) -> Setup:
     for source in named:
         found = ", adopting the folder already there" if backup_dir / source.name in adopted else ""
         logger.debug("source %s: ok (subfolder %s%s)", source.path, source.name, found)
-    return Setup(backup_dir, tuple(named), adopted)
+    return tuple(named), adopted
 
 
 def subfolder_name(name: str | None, path: Path) -> str:
@@ -99,7 +120,7 @@ def check_name(name: str) -> None:
 
 def finish_init(setup: Setup) -> None:
     """Steps 5-7: measure, write the marker, then report through the logger (R1.4, R5.5)."""
-    sizes, space_line, warnings = _measure(setup) if setup.sources else ([], None, [])
+    sizes, space_line, warnings = measure(setup) if setup.sources else ([], None, [])
     try:
         write_marker(setup.backup, setup.sources)
     except OSError as error:
@@ -112,7 +133,7 @@ def finish_init(setup: Setup) -> None:
             f"Couldn't write the marker in {setup.backup / MARKER_DIR}: {reason}."
         ) from error
     logger.info("Initialized syncplan backup at %s", setup.backup)
-    for line in _source_lines(setup.sources, [format_size(size) for size in sizes]):
+    for line in source_lines(setup.sources, [format_size(size) for size in sizes]):
         logger.info("%s", line)
     if space_line is not None:
         logger.info("%s", space_line)
@@ -145,7 +166,7 @@ def _broken(text: str) -> bool:
     return False
 
 
-def _measure(setup: Setup) -> tuple[list[int], str, list[str]]:
+def measure(setup: Setup) -> tuple[list[int], str, list[str]]:
     """R2.5-R2.8: each source's size, the space line, and warnings if the drive looks short."""
     block = space.block_size(setup.backup)
     sizes, skipped = [], 0
@@ -195,11 +216,7 @@ def _check_folder(path: Path) -> None:
 
 
 def _check_backup(backup_dir: Path) -> None:
-    """R2.1-R2.4 and R2.9. The folder's own marker comes before the folders above it (D3)."""
-    _check_folder(backup_dir)
-    own = backup_dir / MARKER_DIR
-    if own.is_symlink() or own.is_junction() or (own.exists() and not own.is_dir()):
-        raise Refusal(f"{own} is not a real folder. Remove it, or choose another backup folder.")
+    """R2.2-R2.4. The folder's own marker comes before the folders above it (D3)."""
     try:
         existing = read_marker(backup_dir)
     except NotInitialized:
@@ -258,7 +275,7 @@ def _check_names(named: Sequence[Source]) -> None:
             raise Refusal(
                 f'Two sources would use the same subfolder name "{source.name}":\n'
                 f"  {seen[key].path}\n  {source.path}\n"
-                f"Name one of them, for example {_quoted(f'{source.name}2={source.path}')}"
+                f"Name one of them, for example {quoted(f'{source.name}2={source.path}')}"
             )
         seen[key] = source
 
@@ -273,7 +290,7 @@ def _check_subfolder(target: Path, source: Source) -> None:
         return
     raise Refusal(
         f"{target} {problem}. Pick another subfolder name,"
-        f" for example {_quoted(f'{source.name}2={source.path}')}"
+        f" for example {quoted(f'{source.name}2={source.path}')}"
     )
 
 
@@ -290,8 +307,8 @@ def _backup_as_source(path: Path, outer: Path, backup_dir: Path) -> tuple[str, E
         sources = read_marker(outer).sources
     except MarkerError as error:
         return f"{intro} {error}", error
-    arguments = " ".join(_quoted(_argument(s)) for s in sources)
-    command = f"syncplan init {_quoted(str(backup_dir))} {arguments}"
+    arguments = " ".join(quoted(_argument(s)) for s in sources)
+    command = f"syncplan init {quoted(str(backup_dir))} {arguments}"
     return f"{intro} Back up its sources instead:\n  {command}", None
 
 
@@ -301,7 +318,7 @@ def _argument(source: Source) -> str:
     return typed if source.name == source.path.name else f"{source.name}={typed}"
 
 
-def _quoted(text: str) -> str:
+def quoted(text: str) -> str:
     return f'"{text}"' if " " in text else text
 
 
@@ -310,13 +327,13 @@ def _already_a_backup(backup_dir: Path, existing: Marker) -> str:
         [
             f"{backup_dir} is already a syncplan backup (created {existing.created.date()}).",
             "Its sources:",
-            *_source_lines(existing.sources),
+            *source_lines(existing.sources),
             "To change them, use syncplan add / syncplan remove.",
         ]
     )
 
 
-def _source_lines(sources: Sequence[Source], sizes: Sequence[str] = ()) -> list[str]:
+def source_lines(sources: Sequence[Source], sizes: Sequence[str] = ()) -> list[str]:
     """One aligned `NAME <- SOURCE` line per source, with an optional size column."""
     if not sources:
         return ["  (no sources)"]

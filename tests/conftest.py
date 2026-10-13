@@ -36,6 +36,40 @@ def setup_folders(tmp_path: Path) -> tuple[Path, Path, Path]:
     return tmp_path / "backup", tmp_path / "src" / "Photos", tmp_path / "src" / "Docs"
 
 
+def tree_snapshot(root: Path) -> dict[str, object]:
+    """Every file, folder and link under root: a file's bytes, None for a folder, a link's target.
+
+    Two equal snapshots prove a run created, deleted and changed nothing there. Links are
+    recorded, not followed, so a junction can't make the walk loop or leave the tree.
+    """
+    snapshot: dict[str, object] = {}
+    pending = [root]
+    while pending:
+        folder = pending.pop()
+        for path in folder.iterdir():
+            key = path.relative_to(root).as_posix()
+            if path.is_symlink() or path.is_junction():
+                snapshot[key] = ("link", str(path.readlink()))
+            elif path.is_dir():
+                snapshot[key] = None
+                pending.append(path)
+            else:
+                snapshot[key] = path.read_bytes()
+    return snapshot
+
+
+def make_backup(run_cli, tmp_path: Path, *names: str) -> tuple[Path, list[Path]]:
+    """An initialized backup, tmp_path/backup, of one synthetic source per name under src/.
+
+    Returns (backup, sources). Each source holds one small file.
+    """
+    make_tree(tmp_path, {"backup": None, **{f"src/{name}/{name}.txt": name for name in names}})
+    backup, sources = tmp_path / "backup", [tmp_path / "src" / name for name in names]
+    code, _, err = run_cli("init", backup, *sources)
+    assert code == 0, err
+    return backup, sources
+
+
 def size_on_disk(path: Path) -> int:
     """Bytes the file really occupies on disk, which for a sparse file is far below its size."""
     high = wintypes.DWORD()
@@ -82,6 +116,12 @@ def program_data(tmp_path_factory, monkeypatch):
     folder = tmp_path_factory.mktemp("programdata")
     monkeypatch.setenv("PROGRAMDATA", str(folder))
     return folder
+
+
+@pytest.fixture
+def typed_case_kept(monkeypatch):
+    """resolve() would restore the on-disk letter case and hide case-sensitive comparisons."""
+    monkeypatch.setattr(Path, "resolve", Path.absolute)
 
 
 @pytest.fixture

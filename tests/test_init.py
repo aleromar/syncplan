@@ -515,12 +515,6 @@ def test_r3_7_a_junction_where_the_subfolder_would_be_is_refused(tmp_path, run_c
     assert refused_and_nothing_written(result, backup, "is a link")
 
 
-@pytest.fixture
-def typed_case_kept(monkeypatch):
-    """resolve() would restore the on-disk letter case and hide case-sensitive comparisons."""
-    monkeypatch.setattr(Path, "resolve", Path.absolute)
-
-
 def test_nfr1_overlap_is_found_whatever_the_letter_case(tmp_path, run_cli, typed_case_kept):
     home = make_tree(tmp_path, {"me/Backup": None}) / "me"
 
