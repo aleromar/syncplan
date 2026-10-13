@@ -6,8 +6,10 @@ it as waiting for the quarantine, which a later plan carries out (R3).
 """
 
 import logging
+import stat
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from syncplan.init import (
@@ -18,6 +20,7 @@ from syncplan.init import (
     check_sources,
     measure,
     quoted,
+    read_argument,
     source_lines,
 )
 from syncplan.marker import (
@@ -35,6 +38,8 @@ from syncplan.marker import (
 from syncplan.space import format_size
 
 logger = logging.getLogger(__name__)
+_TOO_LONG = 260  # Windows' path limit while long paths are off (SP6); longer paths are F8's
+_REPARSE_POINT = stat.FILE_ATTRIBUTE_REPARSE_POINT  # a symbolic link or a junction
 
 
 @dataclass(frozen=True)
@@ -101,6 +106,41 @@ def finish_add(addition: Addition) -> None:
     _report_list(backup, sources, waiting)
 
 
+def remove(backup: str, names: Sequence[str]) -> None:
+    """Steps 1-6 of remove (R2, R3). Nothing is written until every check has passed."""
+    backup_dir = backup_folder(backup, "remove")
+    current = _read(backup_dir)
+    removed: list[Source] = []
+    for name in names:
+        if _named(removed, name) is not None:
+            raise Refusal(f'"{name}" is given twice.')
+        if (source := _named(current.sources, name)) is None:
+            raise Refusal(_not_listed(name, backup_dir, current.sources))
+        removed.append(source)
+    now = datetime.now().astimezone().replace(microsecond=0)
+    copies = [s for s in removed if _has_copy(backup_dir / s.name, backup_dir)]
+    sources = [s for s in current.sources if s not in removed]
+    waiting = [*current.waiting, *(Waiting(s.name, s.path, now) for s in copies)]
+    _save(backup_dir, current, sources, waiting)
+    logger.info("Removed from syncplan backup %s:", backup_dir)
+    for line in source_lines(removed):
+        logger.info("%s", line)
+    for source in removed:
+        if source in copies:
+            logger.info(
+                "The next plan will move %s to the quarantine;"
+                " nothing moves until you apply that plan.",
+                backup_dir / source.name,
+            )
+        else:
+            logger.info(
+                "%s held no copy of %s, so nothing waits for the quarantine.",
+                backup_dir,
+                source.name,
+            )
+    _report_list(backup_dir, sources, waiting)
+
+
 def _read(backup_dir: Path) -> Marker:
     """Step 2: the backup's marker (R4.2, R4.3), with every name in it usable (D12)."""
     try:
@@ -148,6 +188,44 @@ def _check_against_listed(source: Source, listed: Sequence[Source], backup_dir: 
             f'{backup_dir} already has a source named "{old.name}" ({old.path}).'
             f" Name the new one, for example {quoted(f'{source.name}2={source.path}')}"
         )
+
+
+def _not_listed(name: str, backup_dir: Path, sources: Sequence[Source]) -> str:
+    """R2.4's refusal. A listed folder given instead of its name gets that name (D5)."""
+    if any(char in name for char in "\\/:"):
+        path = read_argument(name)[1].resolve()  # read as add reads it: E: means E:\ (D8)
+        for source in sources:
+            if source.path == path:
+                return (
+                    f"remove takes subfolder names, not folders. {source.path} is listed as"
+                    f" {source.name}:\n"
+                    f"  syncplan remove {quoted(str(backup_dir))} {quoted(source.name)}"
+                )
+    heading = f'{backup_dir} has no source named "{name}". Its sources:'
+    return "\n".join([heading, *source_lines(sources)])
+
+
+def _has_copy(folder: Path, backup_dir: Path) -> bool:
+    """D11: True for a plain folder, False when nothing is there; refuses anything else (R3.5).
+
+    One lstat, never exists() or is_dir(): those read any error, even a failing drive, as
+    "missing" (SP6), and the old copy would then drop off the record.
+    """
+    move = f"Move it out of {backup_dir}, then run remove again."
+    if len(str(folder)) >= _TOO_LONG:
+        raise Refusal(
+            f"{folder} is a path of 260 characters or more, too long for syncplan to check. {move}"
+        )
+    try:
+        info = folder.lstat()
+    except FileNotFoundError, NotADirectoryError:
+        backup_dir.stat()  # the backup drive itself gone? Then that error ends the run (SP6)
+        logger.debug("subfolder %s: missing, so nothing waits", folder)
+        return False
+    if stat.S_ISDIR(info.st_mode) and not info.st_file_attributes & _REPARSE_POINT:
+        logger.debug("subfolder %s: a plain folder, waiting for the quarantine", folder)
+        return True
+    raise Refusal(f"{folder} is not a real folder, so it can't wait for the quarantine. {move}")
 
 
 def _save(

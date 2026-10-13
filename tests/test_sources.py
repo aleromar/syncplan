@@ -2,12 +2,17 @@
 
 import json
 import re
+import shutil
+import tempfile
+from datetime import datetime
 from pathlib import Path
 
 import pytest
 from conftest import make_backup, make_tree, tree_snapshot
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
-from syncplan import init, marker, space
+from syncplan import cli, init, marker, space
 from syncplan.marker import Source, read_marker
 
 MARKER = ".syncplan/marker.json"
@@ -503,3 +508,438 @@ def test_nfr2_add_is_refused_while_another_run_holds_the_lock(tmp_path, run_cli,
     refused(run_cli("add", backup, music), "Another syncplan is already running")
 
     assert tree_snapshot(tmp_path) == before
+
+
+def test_dd9_add_and_remove_need_at_least_one_argument(tmp_path, run_cli):
+    backup, _ = make_backup(run_cli, tmp_path, "Photos")
+
+    for command, usage in [
+        ("add", "BACKUP SOURCE [SOURCE ...]"),
+        ("remove", "BACKUP NAME [NAME ...]"),
+    ]:
+        code, _, err = run_cli(command, backup)
+        assert code == 2
+        assert f"usage: syncplan {command} [-h] {usage}" in err
+
+
+# R2 Remove sources
+
+
+@pytest.fixture
+def three(tmp_path, run_cli) -> tuple[Path, list[Path]]:
+    """A backup of Photos, Docs and Music; Photos and Music already have a copy on it."""
+    backup, sources = make_backup(run_cli, tmp_path, "Photos", "Docs", "Music")
+    make_tree(backup, {"Photos/a.jpg": "a", "Music/b.mp3": "b"})
+    return backup, sources
+
+
+def test_r2_1_remove_takes_sources_off_and_keeps_the_rest(run_cli, three):
+    backup, (photos, docs, music) = three
+    created = read_marker(backup).created
+
+    code, _, err = run_cli("remove", backup, "Photos", "Music")
+
+    assert (code, err) == (0, "")
+    found = read_marker(backup)
+    assert found.sources == (Source("Docs", docs.resolve()),)
+    assert [(w.name, w.path) for w in found.waiting] == [
+        ("Photos", photos.resolve()),
+        ("Music", music.resolve()),
+    ]
+    assert found.created == created
+
+
+def test_r2_1_two_removes_in_a_row_keep_the_first_waiting_folder(run_cli, three):
+    backup, _ = three
+
+    assert run_cli("remove", backup, "Photos")[0] == 0
+    assert run_cli("remove", backup, "Music")[0] == 0
+
+    assert [w.name for w in read_marker(backup).waiting] == ["Photos", "Music"]
+
+
+def test_r2_2_report_shows_the_removed_sources_their_fate_and_the_full_list(run_cli, three):
+    backup, (photos, _, _) = three
+
+    code, out, _ = run_cli("remove", backup, "Photos", "Docs")
+
+    assert code == 0
+    removed, _, now = out.partition(f"Sources of {backup} now:\n")
+    assert f"Removed from syncplan backup {backup}:" in removed
+    assert lists_source(removed, "Photos", photos.resolve())
+    assert (
+        f"The next plan will move {backup / 'Photos'} to the quarantine;"
+        " nothing moves until you apply that plan." in removed
+    )
+    assert f"{backup} held no copy of Docs, so nothing waits for the quarantine." in removed
+    assert lists_source(now, "Music", backup.parent / "src" / "Music")
+    assert not lists_source(now, "Photos", photos.resolve())
+    assert f"Waiting for the quarantine:\n  Photos (old copy of {photos.resolve()})\n" in now
+
+
+def test_r2_3_removing_the_last_source_keeps_a_backup_with_none(tmp_path, run_cli):
+    backup, _ = make_backup(run_cli, tmp_path, "Photos")
+
+    code, out, _ = run_cli("remove", backup, "Photos")
+
+    assert code == 0
+    assert read_marker(backup).sources == ()
+    assert f"Sources of {backup} now:\n  (no sources)\n" in out
+
+
+def test_r2_4_a_name_that_is_not_listed_refuses_everything(run_cli, three, tmp_path):
+    backup, _ = three
+    before = tree_snapshot(tmp_path)
+
+    err = refused(
+        run_cli("remove", backup, "Photos", "Musik"),
+        f'{backup} has no source named "Musik". Its sources:',
+    )
+
+    assert lists_source(err, "Music", tmp_path / "src" / "Music")
+    assert tree_snapshot(tmp_path) == before
+
+
+def test_r2_4_a_listed_folder_given_instead_of_its_name_gets_the_name(run_cli, three):
+    backup, (photos, _, _) = three
+
+    refused(
+        run_cli("remove", backup, photos),
+        f"remove takes subfolder names, not folders. {photos.resolve()} is listed as Photos:",
+        f"syncplan remove {backup} Photos",
+    )
+
+
+def test_r2_4_a_bare_drive_given_instead_of_its_name_gets_the_name(tmp_path, run_cli, monkeypatch):
+    # D5: "C:" means C:\, not the current folder on C: (init-marker D8).
+    backup = tmp_path / "backup"
+    hand_written(backup, [("DriveC", "C:\\")])
+    monkeypatch.chdir(tmp_path)
+
+    refused(run_cli("remove", backup, "C:"), "C:\\ is listed as DriveC")
+
+
+def test_r2_4_a_folder_that_is_not_listed_gets_the_list(run_cli, three, tmp_path):
+    backup, _ = three
+
+    refused(run_cli("remove", backup, tmp_path / "Elsewhere"), "has no source named")
+
+
+def test_r2_5_the_same_name_twice_is_refused(run_cli, three, tmp_path):
+    backup, _ = three
+    before = tree_snapshot(tmp_path)
+
+    refused(run_cli("remove", backup, "Photos", "Photos"), '"Photos" is given twice.')
+
+    assert tree_snapshot(tmp_path) == before
+
+
+# R3 Folders waiting for the quarantine
+
+
+def test_r3_1_a_removed_source_with_a_copy_waits_and_its_folder_is_untouched(
+    run_cli, three, tmp_path
+):
+    backup, (photos, _, _) = three
+    before = tree_snapshot(tmp_path)
+
+    assert run_cli("remove", backup, "Photos")[0] == 0
+
+    (waiting,) = read_marker(backup).waiting
+    assert (waiting.name, waiting.path) == ("Photos", photos.resolve())
+    assert waiting.removed.utcoffset() is not None
+    assert abs((datetime.now().astimezone() - waiting.removed).total_seconds()) < 60
+    assert same_but_marker(before, tree_snapshot(tmp_path))
+
+
+def test_r3_2_a_removed_source_without_a_copy_leaves_nothing_waiting(run_cli, three):
+    backup, _ = three
+
+    code, out, _ = run_cli("remove", backup, "Docs")
+
+    assert code == 0
+    assert read_marker(backup).waiting == ()
+    assert "held no copy of Docs" in out
+    assert "Waiting for the quarantine" not in out
+
+
+def test_r3_3_adding_a_removed_source_back_keeps_its_copy(run_cli, three, tmp_path):
+    backup, (photos, _, _) = three
+    run_cli("remove", backup, "Photos")
+    before = tree_snapshot(tmp_path)
+
+    code, out, _ = run_cli("add", backup, photos)
+
+    assert code == 0
+    found = read_marker(backup)
+    assert found.waiting == ()
+    assert found.sources[-1] == Source("Photos", photos.resolve())
+    assert (
+        f"{backup / 'Photos'} was waiting for the quarantine; it is kept and backs up"
+        f" {photos.resolve()} again." in out
+    )
+    assert "already exists" not in out
+    assert same_but_marker(before, tree_snapshot(tmp_path))
+
+
+def test_r3_3_adding_back_after_the_copy_was_deleted_by_hand(run_cli, three):
+    backup, (photos, _, _) = three
+    run_cli("remove", backup, "Photos")
+    (backup / "Photos" / "a.jpg").unlink()
+    (backup / "Photos").rmdir()
+
+    code, out, _ = run_cli("add", backup, photos)
+
+    assert code == 0
+    found = read_marker(backup)
+    assert found.waiting == ()
+    assert found.sources[-1] == Source("Photos", photos.resolve())
+    assert "was waiting" not in out
+    assert "already exists" not in out
+
+
+def test_r3_4_another_folder_cannot_take_a_waiting_name(run_cli, three, tmp_path):
+    backup, (photos, _, _) = three
+    run_cli("remove", backup, "Photos")
+    other = make_tree(tmp_path, {"other/Photos/x.jpg": "x"}) / "other" / "Photos"
+    before = tree_snapshot(tmp_path)
+
+    refused(
+        run_cli("add", backup, other),
+        f"{backup / 'Photos'} holds the old copy of {photos.resolve()} and is waiting for the"
+        " quarantine. Pick another name, for example",
+        f"Photos2={other.resolve()}",
+    )
+
+    assert tree_snapshot(tmp_path) == before
+
+
+def test_dd4_the_same_folder_under_a_new_name_leaves_the_old_copy_waiting(run_cli, three):
+    backup, (photos, _, _) = three
+    run_cli("remove", backup, "Photos")
+
+    assert run_cli("add", backup, f"Pics={photos}")[0] == 0
+
+    found = read_marker(backup)
+    assert [w.name for w in found.waiting] == ["Photos"]
+    assert found.sources[-1] == Source("Pics", photos.resolve())
+
+
+def test_r3_5_a_file_where_the_copy_would_be_is_refused(tmp_path, run_cli):
+    backup, _ = make_backup(run_cli, tmp_path, "Photos")
+    make_tree(backup, {"Photos": "a file"})
+    before = tree_snapshot(tmp_path)
+
+    refused(
+        run_cli("remove", backup, "Photos"),
+        f"{backup / 'Photos'} is not a real folder, so it can't wait for the quarantine.",
+        f"Move it out of {backup}, then run remove again.",
+    )
+
+    assert tree_snapshot(tmp_path) == before
+
+
+def test_r3_5_a_link_where_the_copy_would_be_is_refused(tmp_path, run_cli, junction):
+    backup, (photos,) = make_backup(run_cli, tmp_path, "Photos")
+    junction(backup / "Photos", photos)
+
+    refused(run_cli("remove", backup, "Photos"), "is not a real folder")
+
+
+def test_r3_5_a_copy_whose_path_is_too_long_to_check_is_refused(tmp_path, run_cli):
+    # SP6: Windows reports such a folder as missing even when it exists.
+    backup = tmp_path / "backup"
+    long_name = "N" * (260 - len(str(backup)))
+    assert len(long_name) <= 255
+    hand_written(backup, [(long_name, tmp_path / "src" / "Long")])
+    before = tree_snapshot(tmp_path)
+
+    refused(run_cli("remove", backup, long_name), "260 characters or more", "then run remove again")
+
+    assert tree_snapshot(tmp_path) == before
+
+
+def test_d11_a_copy_that_cannot_be_looked_at_stops_the_run(run_cli, three, tmp_path, monkeypatch):
+    backup, _ = three
+    before = tree_snapshot(tmp_path)
+    real = Path.lstat
+
+    def denied(self):
+        if self.name == "Photos" and self.parent.name == "backup":
+            raise PermissionError(13, "Access is denied", str(self))
+        return real(self)
+
+    monkeypatch.setattr(Path, "lstat", denied)
+
+    code, _, err = run_cli("remove", backup, "Photos")
+
+    monkeypatch.undo()
+    assert code == 1
+    assert "Access is denied" in err
+    assert "Details:" in err
+    assert tree_snapshot(tmp_path) == before
+
+
+# R4 and R6 through remove
+
+
+def test_r4_2_remove_on_a_folder_that_is_not_a_backup_is_refused(tmp_path, run_cli):
+    make_tree(tmp_path, {"backup": None})
+
+    refused(run_cli("remove", tmp_path / "backup", "Photos"), "is not a syncplan backup")
+
+
+def test_r4_3_remove_with_an_unusable_name_in_the_marker_is_refused(tmp_path, run_cli):
+    backup = tmp_path / "backup"
+    path = hand_written(backup, [("..", "C:\\Up")])
+    before = tree_snapshot(tmp_path)
+
+    refused(
+        run_cli("remove", backup, ".."), f'{path} lists the name "..", which syncplan can\'t use'
+    )
+
+    assert tree_snapshot(tmp_path) == before
+
+
+def test_r4_4_remove_on_a_broken_backup_path_says_run_remove_again(tmp_path, run_cli):
+    odd = tmp_path / "B\udc80ckup"
+    odd.mkdir()
+
+    refused(run_cli("remove", odd, "Photos"), "rename that folder and run remove again")
+
+
+def test_r6_2_remove_that_cannot_save_keeps_the_marker(run_cli, three, tmp_path, monkeypatch):
+    backup, _ = three
+    before = tree_snapshot(tmp_path)
+
+    def full_disk(fd):
+        raise OSError(28, "There is not enough space on the disk")
+
+    monkeypatch.setattr(marker.os, "fsync", full_disk)
+
+    code, _, err = run_cli("remove", backup, "Photos")
+
+    assert code == 1
+    assert "Couldn't save the source list in" in err
+    assert "Details:" in err
+    assert tree_snapshot(tmp_path) == before
+
+
+def test_r6_3_remove_keeps_a_marker_changed_meanwhile(run_cli, three, monkeypatch):
+    backup, _ = three
+    edited = json.dumps(
+        {"syncplan_marker": 1, "created": "2026-10-08T16:40:00+02:00", "sources": []}
+    )
+    real = Path.lstat
+
+    def edited_meanwhile(self):
+        if self.name == "Photos":
+            marker_file(backup).write_text(edited)
+        return real(self)
+
+    monkeypatch.setattr(Path, "lstat", edited_meanwhile)
+
+    code, _, err = run_cli("remove", backup, "Photos")
+
+    assert code == 1
+    assert "changed while syncplan was running" in err
+    assert marker_file(backup).read_text() == edited
+
+
+# NFR1 and NFR2 for remove
+
+
+def test_nfr1_names_ignore_letter_case(run_cli, three):
+    backup, _ = three
+
+    assert run_cli("remove", backup, "photos")[0] == 0
+    refused(run_cli("remove", backup, "Music", "MUSIC"), '"MUSIC" is given twice.')
+
+    assert [s.name for s in read_marker(backup).sources] == ["Docs", "Music"]
+
+
+def test_nfr1_a_waiting_name_in_another_case(run_cli, three, tmp_path):
+    backup, (photos, _, _) = three
+    run_cli("remove", backup, "Photos")
+    other = make_tree(tmp_path, {"other/x": "x"}) / "other"
+
+    refused(run_cli("add", backup, f"photos={other}"), "is waiting for the quarantine")
+    assert run_cli("add", backup, f"photos={photos}")[0] == 0  # the same folder: taken back
+
+    assert read_marker(backup).waiting == ()
+
+
+def test_nfr2_remove_is_logged_step_by_step(run_cli, three, program_data):
+    backup, _ = three
+
+    assert run_cli("remove", backup, "Photos")[0] == 0
+
+    log = (program_data / "syncplan" / "logs" / "syncplan.log").read_text(encoding="utf-8")
+    remove_run = log[log.index(f"command: remove {backup} Photos") :]
+    for line in [
+        f"backup {backup}: ok (3 sources, 0 waiting)",
+        f"subfolder {backup / 'Photos'}: a plain folder, waiting for the quarantine",
+        f"marker replaced: {marker_file(backup)}",
+        "exit 0 after",
+    ]:
+        assert line in remove_run, line
+
+
+# A property: random sequences of add and remove (R3.1, R3.3, R3.4, R6)
+
+_NAMES = ["Photos", "Docs", "Music"]
+_STEPS = st.lists(
+    st.tuples(
+        st.sampled_from(["remove", "add back", "new name", "taken name", "delete copy"]),
+        st.integers(0, len(_NAMES) - 1),
+        st.booleans(),
+    ),
+    min_size=1,
+    max_size=6,
+)
+
+
+@settings(max_examples=25, deadline=None)
+@given(_STEPS, st.lists(st.booleans(), min_size=3, max_size=3))
+def test_r3_property_listed_and_waiting_names_never_overlap(steps, has_copy):
+    with tempfile.TemporaryDirectory() as folder:
+        root = Path(folder).resolve()
+        tree = {f"src/{n}/{n}.txt": n for n in _NAMES} | {"backup": None, "other/x": "x"}
+        tree |= {
+            f"backup/{n}/old.txt": "old" for n, copy in zip(_NAMES, has_copy, strict=True) if copy
+        }
+        make_tree(root, tree)
+        backup, src = root / "backup", {n: root / "src" / n for n in _NAMES}
+        assert cli.main(["init", str(backup), *map(str, src.values())]) == 0
+        created = read_marker(backup).created
+        for step, index, upper in steps:
+            name = _NAMES[index]
+            typed = name.upper() if upper else name
+            before = read_marker(backup)
+            if step == "delete copy":
+                if _named(before.waiting, name) and (backup / name).exists():
+                    shutil.rmtree(backup / name)
+                continue
+            argument = {
+                "remove": typed,
+                "add back": f"{typed}={src[name]}",
+                "new name": f"{name}Again={src[name]}",
+                "taken name": f"{typed}={root / 'other'}",
+            }[step]
+            code = cli.main(["remove" if step == "remove" else "add", str(backup), argument])
+            after = read_marker(backup)
+            assert code in (0, 1)
+            if code == 1:
+                assert after.raw == before.raw
+            listed = {s.name.lower() for s in after.sources}
+            assert not listed & {w.name.lower() for w in after.waiting}
+            assert after.created == created
+            for gone in set(before.waiting) - set(after.waiting):  # only R3.3 takes one back
+                assert any(
+                    s.name.lower() == gone.name.lower() and s.path == gone.path
+                    for s in after.sources
+                )
+
+
+def _named(items, name: str):
+    return next((item for item in items if item.name.lower() == name.lower()), None)

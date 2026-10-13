@@ -60,10 +60,12 @@ def _run(argv: list[str]) -> int:
             if setup.sources:
                 logger.info("Measuring sources...")  # a slow USB drive shouldn't look stuck
             init.finish_init(setup)
-        else:
+        elif args.command == "add":
             addition = sources.check_add(args.backup, args.sources)
             logger.info("Measuring sources...")
             sources.finish_add(addition)
+        else:
+            sources.remove(args.backup, args.names)
         return 0
     except init.Refusal as refusal:
         if not _windows_problem(refusal):
@@ -115,6 +117,17 @@ def _parser() -> argparse.ArgumentParser:
         metavar="SOURCE",
         nargs="+",
         help="folder to back up; write NAME=SOURCE to choose its subfolder name",
+    )
+    remove_parser = commands.add_parser(
+        "remove",
+        help="stop backing up sources, named by their subfolder",
+        description="Stop backing up sources of a syncplan backup, named by their subfolder."
+        " Nothing is deleted: a source's folder on the backup stays as it is, waiting for"
+        " the quarantine.",
+    )
+    remove_parser.add_argument("backup", metavar="BACKUP", help="an existing syncplan backup")
+    remove_parser.add_argument(
+        "names", metavar="NAME", nargs="+", help="subfolder name of a source, as listed"
     )
     return parser
 
