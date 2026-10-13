@@ -2,7 +2,7 @@
 
 Back up folders to a backup drive without surprises. syncplan first writes a **plan** listing every copy, overwrite and deletion it intends to make. It changes nothing until you have reviewed that plan and told it to go ahead.
 
-> **Status: early development.** Only `syncplan init` works so far; the other commands are the plan. Don't rely on syncplan for your only copy of anything yet.
+> **Status: early development.** Only `syncplan init`, `syncplan add` and `syncplan remove` work so far; the other commands are the plan. Don't rely on syncplan for your only copy of anything yet.
 
 ## How it will work
 
@@ -40,6 +40,47 @@ Space needed: about 400 GB. E:\ has 1.8 TB free.
 - **Space.** It estimates the space needed and warns, without stopping, if the drive looks too small or would be left with less than 10% free.
 - **Redundancy.** You can back up the same sources to several drives: run `init` once per drive.
 - **Not a backup source.** syncplan's own folder, `C:\ProgramData\syncplan`, can't be one, so a whole `C:` drive is refused; back up its folders instead.
+
+## Changing a backup's sources
+
+```
+usage: syncplan add [-h] BACKUP SOURCE [SOURCE ...]
+usage: syncplan remove [-h] BACKUP NAME [NAME ...]
+```
+
+`add` backs up more folders to an existing backup. It takes sources exactly as `init` does, `NAME=SOURCE` included, and runs the same checks. It also refuses a folder that is already a source, inside one or holding one, and a subfolder name that is already taken:
+
+```
+> syncplan add E:\Backups D:\Music
+Measuring sources...
+Added to syncplan backup E:\Backups:
+  Music <- D:\Music      45 GB
+Space needed: about 45 GB. E:\ has 120 GB free.
+Sources of E:\Backups now:
+  Photos    <- C:\Photos
+  Documents <- D:\Work\Documents
+  Music     <- D:\Music
+```
+
+`remove` stops backing up sources, named by their subfolder name as listed. It works even when the source folder or its drive is gone:
+
+```
+> syncplan remove E:\Backups Photos
+Removed from syncplan backup E:\Backups:
+  Photos <- C:\Photos
+The next plan will move E:\Backups\Photos to the quarantine; nothing moves until you apply that plan.
+Sources of E:\Backups now:
+  Documents <- D:\Work\Documents
+  Music     <- D:\Music
+Waiting for the quarantine:
+  Photos (old copy of C:\Photos)
+```
+
+- **Nothing is deleted.** `remove` only changes the list. The old copy stays on the backup, recorded as waiting for the quarantine, and moves there only when you apply a plan.
+- **Undo.** Add the same folder back under the same name, and its old copy is kept as its copy again.
+- **A waiting name is taken.** While an old copy waits, another folder can't use its name.
+- **All or nothing.** If anything in the command is wrong, such as a source already listed or a name that isn't, nothing changes.
+- **Only the marker changes.** Both commands rewrite `E:\Backups\.syncplan\marker.json` and nothing else. The new list is written to a temporary file, flushed to disk and swapped in with one step, so the marker is never half-written. On drives formatted as exFAT or FAT32, an unplug at that exact moment is the one exception.
 
 ## Logs
 
