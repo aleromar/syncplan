@@ -3,7 +3,9 @@
 import ctypes
 import msvcrt
 import os
+import stat
 import subprocess
+import sys
 from ctypes import wintypes
 from pathlib import Path
 
@@ -16,6 +18,14 @@ _kernel32.GetCompressedFileSizeW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(wi
 _kernel32.GetCompressedFileSizeW.restype = wintypes.DWORD  # unsigned, or big sizes go negative
 _FSCTL_SET_SPARSE = 0x000900C4
 _INVALID_FILE_SIZE = 0xFFFFFFFF
+
+_HOLD_LOCK = """
+import msvcrt, os, sys, time
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_CREAT)
+msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+print("held", flush=True)
+time.sleep(60)
+"""
 
 
 def make_tree(root: Path, entries: dict[str, str | bytes | None]) -> Path:
@@ -122,6 +132,21 @@ def program_data(tmp_path_factory, monkeypatch):
 def typed_case_kept(monkeypatch):
     """resolve() would restore the on-disk letter case and hide case-sensitive comparisons."""
     monkeypatch.setattr(Path, "resolve", Path.absolute)
+
+
+@pytest.fixture
+def held_lock(program_data):
+    """Another syncplan run, simulated by a process holding the run lock."""
+    lock = program_data / "syncplan" / "syncplan.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    holder = subprocess.Popen(
+        [sys.executable, "-c", _HOLD_LOCK, str(lock)], stdout=subprocess.PIPE, text=True
+    )
+    assert holder.stdout.readline().strip() == "held"
+    yield lock
+    holder.kill()
+    holder.wait()
+    lock.chmod(stat.S_IWRITE)
 
 
 @pytest.fixture

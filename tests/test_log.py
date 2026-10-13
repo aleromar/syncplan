@@ -17,13 +17,6 @@ from syncplan.marker import Source
 PREFIX = re.compile(
     r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3}[+-]\d\d:\d\d [A-Z]+ +\[run ([0-9a-f]{4})\] "
 )
-HOLD_LOCK = """
-import msvcrt, os, sys, time
-fd = os.open(sys.argv[1], os.O_RDONLY | os.O_CREAT)
-msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-print("held", flush=True)
-time.sleep(60)
-"""
 BUG_WHILE_LOG_IS_OFF = """
 import sys
 from syncplan import cli, init
@@ -80,21 +73,6 @@ def seed_logs(program_data: Path, current: bytes, olds: int = log.OLD_LOGS) -> N
 def old_logs(program_data: Path) -> list[bytes | None]:
     paths = (old(program_data, n) for n in range(1, log.OLD_LOGS + 1))
     return [path.read_bytes() if path.exists() else None for path in paths]
-
-
-@pytest.fixture
-def held_lock(program_data):
-    """Another syncplan run, simulated by a process holding the run lock."""
-    lock = program_data / "syncplan" / "syncplan.lock"
-    lock.parent.mkdir(parents=True, exist_ok=True)
-    holder = subprocess.Popen(
-        [sys.executable, "-c", HOLD_LOCK, str(lock)], stdout=subprocess.PIPE, text=True
-    )
-    assert holder.stdout.readline().strip() == "held"
-    yield lock
-    holder.kill()
-    holder.wait()
-    lock.chmod(stat.S_IWRITE)
 
 
 @pytest.fixture

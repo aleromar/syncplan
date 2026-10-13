@@ -53,16 +53,19 @@ def read_argument(text: str) -> tuple[str | None, Path]:
 
 def check_init(backup: str, sources: Sequence[str]) -> Setup:
     """Steps 1-4: resolve every path, then refuse anything unsafe. Nothing is written."""
-    backup_dir = backup_folder(backup)
+    backup_dir = backup_folder(backup, "init")
     _check_backup(backup_dir)
     logger.debug("backup %s: ok (exists, no marker, no backup above)", backup_dir)
-    named, adopted = check_sources(backup_dir, sources)
+    named, adopted = check_sources(backup_dir, sources, "init")
     return Setup(backup_dir, named, adopted)
 
 
-def backup_folder(text: str) -> Path:
-    """R2.1, R2.9 and R2.10: the backup folder, resolved. Refuses a missing or exotic one."""
-    backup_dir = _resolve(_bare_drive(Path(text)))
+def backup_folder(text: str, command: str) -> Path:
+    """R2.1, R2.9 and R2.10: the backup folder, resolved. Refuses a missing or exotic one.
+
+    command is the syncplan command running; refusals name it (manage-sources D7).
+    """
+    backup_dir = _resolve(_bare_drive(Path(text)), command)
     _check_folder(backup_dir)
     own = backup_dir / MARKER_DIR
     if own.is_symlink() or own.is_junction() or (own.exists() and not own.is_dir()):
@@ -71,15 +74,15 @@ def backup_folder(text: str) -> Path:
 
 
 def check_sources(
-    backup_dir: Path, arguments: Sequence[str]
+    backup_dir: Path, arguments: Sequence[str], command: str
 ) -> tuple[tuple[Source, ...], tuple[Path, ...]]:
     """Steps 3-4 for each SOURCE or NAME=SOURCE (R3.1-R3.9). Nothing is written.
 
     Returns the sources, named, and the folders already on the backup they adopt (R1.5).
     """
-    given = [(name, _resolve(path)) for name, path in map(read_argument, arguments)]
+    given = [(name, _resolve(path, command)) for name, path in map(read_argument, arguments)]
     for _, path in given:
-        _check_source(path, backup_dir)
+        _check_source(path, backup_dir, command)
         logger.debug("source %s: exists, not syncplan's or a backup, apart from the backup", path)
     for (_, first), (_, second) in combinations(given, 2):
         _check_apart(first, second)
@@ -141,7 +144,7 @@ def finish_init(setup: Setup) -> None:
         logger.warning("%s", warning)
 
 
-def _resolve(path: Path) -> Path:
+def _resolve(path: Path, command: str) -> Path:
     """Basic cases only (PD10): a drive-letter path in valid text, made absolute (R1.3)."""
     resolved = None if str(path).startswith(("\\\\", "//")) else path.resolve()
     if resolved is None or str(resolved).startswith(("\\\\?\\", "\\\\.\\")):
@@ -152,7 +155,7 @@ def _resolve(path: Path) -> Path:
     if _broken(str(resolved)):
         raise Refusal(
             f"{resolved} has a character that isn't valid text;"
-            " rename that folder and run init again."
+            f" rename that folder and run {command} again."
         )
     return resolved
 
@@ -230,8 +233,12 @@ def _check_backup(backup_dir: Path) -> None:
             raise Refusal(f"{backup_dir} is inside the syncplan backup {parent}.")
 
 
-def _check_source(path: Path, backup_dir: Path) -> None:
-    """R3.1, R3.9, R3.6 and R3.2 for one source. Paths are resolved, so links can't hide."""
+def _check_source(path: Path, backup_dir: Path, command: str) -> None:
+    """R3.1, R3.9, R3.6 and R3.2 for one source. Paths are resolved, so links can't hide.
+
+    The backup's own marker is skipped: init has none yet, and for add a source inside the
+    backup gets R3.2's message rather than R3.6's (manage-sources D7).
+    """
     _check_folder(path)
     own = log.home().resolve()
     if path == own:
@@ -244,8 +251,8 @@ def _check_source(path: Path, backup_dir: Path) -> None:
             " for example C:\\Users\\you."
         )
     for folder in (path, *path.parents):
-        if has_marker(folder):
-            message, cause = _backup_as_source(path, folder, backup_dir)
+        if folder != backup_dir and has_marker(folder):
+            message, cause = _backup_as_source(path, folder, backup_dir, command)
             raise Refusal(message) from cause  # a Windows error behind it gets Details (R5.2)
     if path == backup_dir:
         raise Refusal(f"{path} is both the backup and a source.")
@@ -294,7 +301,9 @@ def _check_subfolder(target: Path, source: Source) -> None:
     )
 
 
-def _backup_as_source(path: Path, outer: Path, backup_dir: Path) -> tuple[str, Exception | None]:
+def _backup_as_source(
+    path: Path, outer: Path, backup_dir: Path, command: str
+) -> tuple[str, Exception | None]:
     """R3.6: name the backup that holds the source, and suggest its own sources instead.
 
     Returns the message, and the marker check's error when the marker couldn't be read.
@@ -308,8 +317,8 @@ def _backup_as_source(path: Path, outer: Path, backup_dir: Path) -> tuple[str, E
     except MarkerError as error:
         return f"{intro} {error}", error
     arguments = " ".join(quoted(_argument(s)) for s in sources)
-    command = f"syncplan init {quoted(str(backup_dir))} {arguments}"
-    return f"{intro} Back up its sources instead:\n  {command}", None
+    instead = f"syncplan {command} {quoted(str(backup_dir))} {arguments}"
+    return f"{intro} Back up its sources instead:\n  {instead}", None
 
 
 def _argument(source: Source) -> str:

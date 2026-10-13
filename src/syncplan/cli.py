@@ -9,7 +9,7 @@ import sys
 from importlib.metadata import version
 from typing import IO
 
-from syncplan import init, log
+from syncplan import init, log, sources
 
 logger = logging.getLogger(__name__)
 
@@ -55,10 +55,15 @@ def _run(argv: list[str]) -> int:
         parser.print_help()
         return 0
     try:
-        setup = init.check_init(args.backup, args.sources)
-        if setup.sources:
-            logger.info("Measuring sources...")  # a slow USB drive shouldn't look stuck
-        init.finish_init(setup)
+        if args.command == "init":
+            setup = init.check_init(args.backup, args.sources)
+            if setup.sources:
+                logger.info("Measuring sources...")  # a slow USB drive shouldn't look stuck
+            init.finish_init(setup)
+        else:
+            addition = sources.check_add(args.backup, args.sources)
+            logger.info("Measuring sources...")
+            sources.finish_add(addition)
         return 0
     except init.Refusal as refusal:
         if not _windows_problem(refusal):
@@ -96,6 +101,19 @@ def _parser() -> argparse.ArgumentParser:
         "sources",
         metavar="SOURCE",
         nargs="*",
+        help="folder to back up; write NAME=SOURCE to choose its subfolder name",
+    )
+    add_parser = commands.add_parser(
+        "add",
+        help="add source folders to an existing backup",
+        description="Add source folders to an existing syncplan backup. Only its marker file"
+        " changes; nothing is copied.",
+    )
+    add_parser.add_argument("backup", metavar="BACKUP", help="an existing syncplan backup")
+    add_parser.add_argument(
+        "sources",
+        metavar="SOURCE",
+        nargs="+",
         help="folder to back up; write NAME=SOURCE to choose its subfolder name",
     )
     return parser
