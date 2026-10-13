@@ -9,9 +9,10 @@ import sys
 from importlib.metadata import version
 from typing import IO
 
-from syncplan import init, log
+from syncplan import init, log, sources
 
 logger = logging.getLogger(__name__)
+_SOURCE_HELP = "folder to back up; write NAME=SOURCE to choose its subfolder name"
 
 
 class _Parser(argparse.ArgumentParser):
@@ -55,10 +56,17 @@ def _run(argv: list[str]) -> int:
         parser.print_help()
         return 0
     try:
-        setup = init.check_init(args.backup, args.sources)
-        if setup.sources:
-            logger.info("Measuring sources...")  # a slow USB drive shouldn't look stuck
-        init.finish_init(setup)
+        if args.command == "init":
+            setup = init.check_init(args.backup, args.sources)
+            if setup.sources:
+                logger.info("Measuring sources...")  # a slow USB drive shouldn't look stuck
+            init.finish_init(setup)
+        elif args.command == "add":
+            addition = sources.check_add(args.backup, args.sources)
+            logger.info("Measuring sources...")
+            sources.finish_add(addition)
+        else:
+            sources.remove(args.backup, args.names)
         return 0
     except init.Refusal as refusal:
         if not _windows_problem(refusal):
@@ -96,7 +104,31 @@ def _parser() -> argparse.ArgumentParser:
         "sources",
         metavar="SOURCE",
         nargs="*",
-        help="folder to back up; write NAME=SOURCE to choose its subfolder name",
+        help=_SOURCE_HELP,
+    )
+    add_parser = commands.add_parser(
+        "add",
+        help="add source folders to an existing backup",
+        description="Add source folders to an existing syncplan backup. Only its marker file"
+        " changes; nothing is copied.",
+    )
+    add_parser.add_argument("backup", metavar="BACKUP", help="an existing syncplan backup")
+    add_parser.add_argument(
+        "sources",
+        metavar="SOURCE",
+        nargs="+",
+        help=_SOURCE_HELP,
+    )
+    remove_parser = commands.add_parser(
+        "remove",
+        help="stop backing up sources, named by their subfolder",
+        description="Stop backing up sources of a syncplan backup, named by their subfolder."
+        " Nothing is deleted: a source's folder on the backup stays as it is, waiting for"
+        " the quarantine.",
+    )
+    remove_parser.add_argument("backup", metavar="BACKUP", help="an existing syncplan backup")
+    remove_parser.add_argument(
+        "names", metavar="NAME", nargs="+", help="subfolder name of a source, as listed"
     )
     return parser
 

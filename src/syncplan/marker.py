@@ -1,14 +1,15 @@
 """The backup marker, `<backup>\\.syncplan\\marker.json`.
 
-It says a folder is a syncplan backup and lists the source folders it holds.
+It says a folder is a syncplan backup, lists the source folders it holds, and lists the
+folders of removed sources that wait for the quarantine.
 """
 
 import json
 import logging
 import os
 import tempfile
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -25,9 +26,20 @@ class Source:
 
 
 @dataclass(frozen=True)
+class Waiting:
+    """A removed source's subfolder, waiting for the quarantine (manage-sources R3.1)."""
+
+    name: str
+    path: Path
+    removed: datetime
+
+
+@dataclass(frozen=True)
 class Marker:
     created: datetime
     sources: tuple[Source, ...]
+    waiting: tuple[Waiting, ...] = ()
+    raw: bytes = field(default=b"", compare=False, repr=False)  # as read (manage-sources D2)
 
 
 class MarkerError(Exception):
@@ -46,7 +58,12 @@ class NewerMarker(MarkerError):
     pass
 
 
-def _marker_path(folder: Path) -> Path:
+class MarkerChanged(MarkerError):
+    pass
+
+
+def marker_path(folder: Path) -> Path:
+    """Where the folder's marker is, whether or not it exists."""
     return folder / MARKER_DIR / MARKER_NAME
 
 
@@ -57,7 +74,7 @@ def has_marker(folder: Path) -> bool:
     can't be checked must not pass for no marker.
     """
     try:
-        _marker_path(folder).stat()
+        marker_path(folder).stat()
     except FileNotFoundError, NotADirectoryError:
         return False
     return True
@@ -65,10 +82,11 @@ def has_marker(folder: Path) -> bool:
 
 def read_marker(folder: Path) -> Marker:
     """The marker check: the folder's marker, or a MarkerError saying why there is none."""
-    path = _marker_path(folder)
+    path = marker_path(folder)
     unreadable = UnreadableMarker(f"{path} can't be read; inspect it.")
     try:
-        data = json.loads(path.read_text(encoding="utf-8-sig"))
+        raw = path.read_bytes()
+        data = _parse(raw)
     except FileNotFoundError:
         raise NotInitialized(f"{folder} is not a syncplan backup.") from None
     except (OSError, ValueError) as error:
@@ -83,14 +101,21 @@ def read_marker(folder: Path) -> Marker:
         raise NewerMarker(f"{path} was written by a newer syncplan; upgrade syncplan to use it.")
     try:
         created = datetime.fromisoformat(data["created"])
-        if type(data["sources"]) is not list:
-            raise TypeError(data["sources"])
         sources = tuple(
-            Source(_text(item["name"]), Path(_text(item["path"]))) for item in data["sources"]
+            Source(_text(item["name"]), Path(_text(item["path"])))
+            for item in _list(data["sources"])
+        )
+        waiting = tuple(
+            Waiting(
+                _text(item["name"]),
+                Path(_text(item["path"])),
+                datetime.fromisoformat(_text(item["removed"])),
+            )
+            for item in _list(data.get("to_quarantine", []))
         )
     except (KeyError, TypeError, ValueError) as error:
         raise unreadable from error
-    return Marker(created, sources)
+    return Marker(created, sources, waiting, raw)
 
 
 def write_marker(folder: Path, sources: Sequence[Source]) -> Marker:
@@ -100,32 +125,75 @@ def write_marker(folder: Path, sources: Sequence[Source]) -> Marker:
     Either way, no marker and no temporary file is left behind.
     """
     marker = Marker(datetime.now().astimezone().replace(microsecond=0), tuple(sources))
-    text = json.dumps(
-        {
-            "syncplan_marker": FORMAT,
-            "created": marker.created.isoformat(),
-            "sources": [{"name": s.name, "path": str(s.path)} for s in marker.sources],
-        },
-        indent=2,
-    )
+    data = {
+        "syncplan_marker": FORMAT,
+        "created": marker.created.isoformat(),
+        "sources": [_source_entry(s) for s in marker.sources],
+    }
     own_dir = folder / MARKER_DIR
     created_dir = not own_dir.exists()
     own_dir.mkdir(exist_ok=True)
+    _swap_in(own_dir, data, lambda temp: temp.rename(marker_path(folder)), created_dir)
+    logger.debug("marker written: %s", marker_path(folder))
+    return marker
+
+
+def replace_marker(
+    folder: Path, old: Marker, sources: Sequence[Source], waiting: Sequence[Waiting]
+) -> None:
+    """Replace the folder's marker, read earlier as old, with new lists (manage-sources D2, D3).
+
+    Every other field of the marker is kept, and so is the original entry of every source
+    and waiting folder that stays. Raises MarkerChanged if the marker on disk is no longer
+    the one old was read from, or OSError if writing fails. Either way the marker on disk
+    is left as it was.
+    """
+    data = _parse(old.raw)
+    data["sources"] = _keep_originals(data["sources"], [_source_entry(s) for s in sources])
+    entries = [{**_source_entry(w), "removed": w.removed.isoformat()} for w in waiting]
+    data["to_quarantine"] = _keep_originals(data.get("to_quarantine", []), entries)
+    if not data["to_quarantine"]:
+        del data["to_quarantine"]
+    target = marker_path(folder)
+
+    def check_then_replace(temp: Path) -> None:
+        # Checked right before the swap, after the slow fsync (manage-sources K3).
+        try:
+            current = target.read_bytes()
+        except FileNotFoundError:
+            target.parent.stat()  # the drive gone? That is the error (manage-sources SP6)
+            current = None
+        if current != old.raw:
+            raise MarkerChanged(
+                f"The source list of {folder} changed while syncplan was running;"
+                " nothing was changed. Check it and run the command again."
+            )
+        temp.replace(target)
+
+    _swap_in(target.parent, data, check_then_replace, created_dir=False)
+    logger.debug("marker replaced: %s", target)
+
+
+def _swap_in(own_dir: Path, data: dict, swap: Callable[[Path], None], created_dir: bool) -> None:
+    """Write data to a new temporary file in own_dir, flushed and closed, then swap it in.
+
+    If anything fails, the temporary file, and own_dir if this write created it, are
+    removed when possible (R1.6, manage-sources R6.2).
+    """
+    text = json.dumps(data, indent=2) + "\n"
     temp, done = None, False
     try:
         handle, name = tempfile.mkstemp(prefix="marker-", suffix=".tmp", dir=own_dir)
         temp = Path(name)
         with os.fdopen(handle, "w", encoding="ascii", newline="\n") as file:
-            file.write(text + "\n")
+            file.write(text)
             file.flush()
             os.fsync(file.fileno())
-        temp.rename(_marker_path(folder))
+        swap(temp)  # only once closed: an open file can't be renamed (manage-sources SP4)
         done = True
-        logger.debug("marker written: %s", _marker_path(folder))
     finally:
         if not done:
             _clean_up([temp] + ([own_dir] if created_dir else []))
-    return marker
 
 
 def _clean_up(leftovers: list[Path | None]) -> None:
@@ -144,6 +212,27 @@ def _clean_up(leftovers: list[Path | None]) -> None:
         ", ".join(removed) or "nothing",
         f"; left: {', '.join(left)}" if left else "",
     )
+
+
+def _parse(raw: bytes) -> dict:
+    """The marker's JSON. A byte-order mark is fine: Notepad may add one (init-marker D12)."""
+    return json.loads(raw.decode("utf-8-sig"))
+
+
+def _source_entry(source: Source | Waiting) -> dict:
+    return {"name": source.name, "path": str(source.path)}
+
+
+def _keep_originals(before: list[dict], after: list[dict]) -> list[dict]:
+    """The after entries, each kept as its original object if it was there (manage-sources D3)."""
+    originals = {(item["name"], str(Path(item["path"]))): item for item in before}
+    return [originals.get((entry["name"], entry["path"]), entry) for entry in after]
+
+
+def _list(value: object) -> list:
+    if type(value) is not list:
+        raise TypeError(value)
+    return value
 
 
 def _text(value: object) -> str:

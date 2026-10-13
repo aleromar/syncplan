@@ -1,13 +1,12 @@
 import json
 import os
-import re
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
 import pytest
-from conftest import make_tree, setup_folders
+from conftest import lists_source, make_tree, setup_folders
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
@@ -18,10 +17,6 @@ from syncplan.marker import Source, read_marker
 
 def sources_of(backup: Path) -> tuple[Source, ...]:
     return read_marker(backup).sources
-
-
-def lists_source(report: str, name: str, path: Path) -> bool:
-    return re.search(rf"^\s+{re.escape(name)}\s+<- {re.escape(str(path))}(\s|$)", report, re.M)
 
 
 # R1 Initialize a backup
@@ -513,12 +508,6 @@ def test_r3_7_a_junction_where_the_subfolder_would_be_is_refused(tmp_path, run_c
     result = run_cli("init", backup, photos)
 
     assert refused_and_nothing_written(result, backup, "is a link")
-
-
-@pytest.fixture
-def typed_case_kept(monkeypatch):
-    """resolve() would restore the on-disk letter case and hide case-sensitive comparisons."""
-    monkeypatch.setattr(Path, "resolve", Path.absolute)
 
 
 def test_nfr1_overlap_is_found_whatever_the_letter_case(tmp_path, run_cli, typed_case_kept):

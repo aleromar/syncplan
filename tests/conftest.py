@@ -3,7 +3,10 @@
 import ctypes
 import msvcrt
 import os
+import re
+import stat
 import subprocess
+import sys
 from ctypes import wintypes
 from pathlib import Path
 
@@ -16,6 +19,14 @@ _kernel32.GetCompressedFileSizeW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(wi
 _kernel32.GetCompressedFileSizeW.restype = wintypes.DWORD  # unsigned, or big sizes go negative
 _FSCTL_SET_SPARSE = 0x000900C4
 _INVALID_FILE_SIZE = 0xFFFFFFFF
+
+_HOLD_LOCK = """
+import msvcrt, os, sys, time
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_CREAT)
+msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+print("held", flush=True)
+time.sleep(60)
+"""
 
 
 def make_tree(root: Path, entries: dict[str, str | bytes | None]) -> Path:
@@ -34,6 +45,52 @@ def setup_folders(tmp_path: Path) -> tuple[Path, Path, Path]:
     """An empty backup folder and two sources. Returns (backup, Photos, Docs)."""
     make_tree(tmp_path, {"src/Photos/a.jpg": "a", "src/Docs/b.txt": "b", "backup": None})
     return tmp_path / "backup", tmp_path / "src" / "Photos", tmp_path / "src" / "Docs"
+
+
+def tree_snapshot(root: Path) -> dict[str, object]:
+    """Every file, folder and link under root: a file's bytes, None for a folder, a link's target.
+
+    Two equal snapshots prove a run created, deleted and changed nothing there. Links are
+    recorded, not followed, so a junction can't make the walk loop or leave the tree.
+    """
+    snapshot: dict[str, object] = {}
+    pending = [root]
+    while pending:
+        folder = pending.pop()
+        for path in folder.iterdir():
+            key = path.relative_to(root).as_posix()
+            if path.is_symlink() or path.is_junction():
+                snapshot[key] = ("link", str(path.readlink()))
+            elif path.is_dir():
+                snapshot[key] = None
+                pending.append(path)
+            else:
+                snapshot[key] = path.read_bytes()
+    return snapshot
+
+
+def lists_source(report: str, name: str, path: Path) -> bool:
+    """True if report has an aligned `NAME <- SOURCE` line for this source."""
+    return bool(
+        re.search(rf"^\s+{re.escape(name)}\s+<- {re.escape(str(path))}(\s|$)", report, re.M)
+    )
+
+
+def marker_names(folder: Path) -> list[str]:
+    """What is in the folder's .syncplan: the marker, and any temporary file left behind."""
+    return sorted(p.name for p in (folder / ".syncplan").iterdir())
+
+
+def make_backup(run_cli, tmp_path: Path, *names: str) -> tuple[Path, list[Path]]:
+    """An initialized backup, tmp_path/backup, of one synthetic source per name under src/.
+
+    Returns (backup, sources). Each source holds one small file.
+    """
+    make_tree(tmp_path, {"backup": None, **{f"src/{name}/{name}.txt": name for name in names}})
+    backup, sources = tmp_path / "backup", [tmp_path / "src" / name for name in names]
+    code, _, err = run_cli("init", backup, *sources)
+    assert code == 0, err
+    return backup, sources
 
 
 def size_on_disk(path: Path) -> int:
@@ -82,6 +139,27 @@ def program_data(tmp_path_factory, monkeypatch):
     folder = tmp_path_factory.mktemp("programdata")
     monkeypatch.setenv("PROGRAMDATA", str(folder))
     return folder
+
+
+@pytest.fixture
+def typed_case_kept(monkeypatch):
+    """resolve() would restore the on-disk letter case and hide case-sensitive comparisons."""
+    monkeypatch.setattr(Path, "resolve", Path.absolute)
+
+
+@pytest.fixture
+def held_lock(program_data):
+    """Another syncplan run, simulated by a process holding the run lock."""
+    lock = program_data / "syncplan" / "syncplan.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    holder = subprocess.Popen(
+        [sys.executable, "-c", _HOLD_LOCK, str(lock)], stdout=subprocess.PIPE, text=True
+    )
+    assert holder.stdout.readline().strip() == "held"
+    yield lock
+    holder.kill()
+    holder.wait()
+    lock.chmod(stat.S_IWRITE)
 
 
 @pytest.fixture
