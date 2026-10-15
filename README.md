@@ -2,12 +2,12 @@
 
 Back up folders to a backup drive without surprises. syncplan first writes a **plan** listing every copy, overwrite and deletion it intends to make. It changes nothing until you have reviewed that plan and told it to go ahead.
 
-> **Status: early development.** Only `syncplan init`, `syncplan add` and `syncplan remove` work so far; the other commands are the plan. Don't rely on syncplan for your only copy of anything yet.
+> **Status: early development.** `syncplan init`, `add`, `remove` and `plan` work so far; `apply`, which carries a plan out, comes next. Don't rely on syncplan for your only copy of anything yet.
 
 ## How it will work
 
 1. `syncplan init <backup> <sources>` marks a folder or drive as a syncplan backup of those source folders. Later runs refuse any destination without that marker, or whose marker doesn't list the source, so a changed drive letter can't point a sync at the wrong disk.
-2. `syncplan plan` compares your source folders with the backup and writes a plan file. Nothing is modified.
+2. `syncplan plan <backup> <source>` compares a source folder with its copy on the backup and writes a plan file. Nothing else is modified.
 3. You read the plan.
 4. `syncplan apply <plan>` carries out exactly that plan and nothing else.
 
@@ -81,6 +81,58 @@ Waiting for the quarantine:
 - **A waiting name is taken.** While an old copy waits, another folder can't use its name.
 - **All or nothing.** If anything in the command is wrong, such as a source already listed or a name that isn't, nothing changes.
 - **Only the marker changes.** Both commands rewrite `E:\Backups\.syncplan\marker.json` and nothing else. The new list is written to a temporary file, flushed to disk and swapped in with one step, so the marker is never half-written. On drives formatted as exFAT or FAT32, an unplug at that exact moment is the one exception.
+
+## Planning a backup
+
+```
+usage: syncplan plan [-h] [--quick] [--overwrite FILE [FILE ...]] BACKUP SOURCE
+```
+
+`plan` compares one source folder with its copy on the backup, and writes a plan of what would bring the copy up to date. It changes nothing else: no file in the source, and nothing on the backup but the plan file.
+
+```
+> syncplan plan E:\Backups C:\Photos
+Listing C:\Photos and E:\Backups\Photos...
+Reading 46,990 files to compare (290 GB)...
+  12 GB of 290 GB read (1,900 of 46,990 files)
+  ...
+Plan for Photos (C:\Photos -> E:\Backups\Photos):
+  copy (new)       1,204 files    12 GB
+  overwrite           37 files   840 MB
+  set date             5 files
+  make folder          3 folders
+  unchanged       46,950 files
+To copy: 12.8 GB. E:\ has 120 GB free.
+Plan written to E:\Backups\.syncplan\plans\Photos.json
+Nothing has been changed.
+```
+
+- **What it plans.**
+  - A new file is copied.
+  - A file whose content differs and whose source date is later is overwritten; apply will keep the old copy in the quarantine.
+  - A file whose only difference is its date gets the source's date.
+  - A folder missing on the backup, even an empty one, is made.
+- **Reading, or `--quick`.** By default plan reads both copies of every file that has the same size on both drives, and compares them byte for byte. That finds a file damaged on disk, and a change of date alone. It takes time: about an hour for 300 GB over USB 3. `--quick` compares only sizes and dates, and reads nothing.
+- **Your decision.** In these cases plan touches neither copy and lists both copies' dates and sizes:
+  - the content differs but the source's date isn't later: the same date with another size, the same date and size with different bytes (possible damage), or a backup copy newer than the source;
+  - the backup's copy can't be read.
+
+  If the source's file is right, plan again with `--overwrite C:\Photos\file.jpg`. If the backup's file is right, copy it back to the source yourself.
+- **Skipped, and listed.** These are skipped and listed:
+  - folders or files that can't be read;
+  - links;
+  - paths of 260 characters or more;
+  - names Windows can't normally use;
+  - a file on one side where the other has a folder;
+  - a syncplan backup inside the source;
+  - files that are online-only in OneDrive;
+  - files that change while plan reads them.
+- **Refused.** plan refuses:
+  - a source the backup doesn't list;
+  - a source whose folder is missing (deleted, or its drive unplugged);
+  - a backup drive that isn't formatted as NTFS.
+- **The plan file.** `<backup>\.syncplan\plans\<NAME>.json`, one per source, replaced by each plan and written even when there is nothing to do. It is JSON, readable in Notepad.
+- **Files no longer in the source.** Files on the backup that are no longer in the source are counted, and left as they are for now.
 
 ## Logs
 

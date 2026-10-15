@@ -6,39 +6,35 @@ it as waiting for the quarantine, which a later plan carries out (R3).
 """
 
 import logging
-import stat
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from syncplan.init import (
+from syncplan.checks import (
+    PATH_LIMIT,
     Refusal,
     Setup,
     backup_folder,
-    check_name,
     check_sources,
-    measure,
+    checked_marker,
+    plain_folder,
     quoted,
     read_argument,
     source_lines,
+    too_long,
 )
 from syncplan.marker import (
     MARKER_DIR,
     Marker,
     MarkerChanged,
-    MarkerError,
-    NotInitialized,
     Source,
     Waiting,
-    marker_path,
-    read_marker,
     replace_marker,
 )
-from syncplan.space import format_size
+from syncplan.space import format_size, measure
 
 logger = logging.getLogger(__name__)
-_TOO_LONG = 260  # Windows' path limit while long paths are off (SP6); longer paths are F8's
 
 
 @dataclass(frozen=True)
@@ -53,12 +49,12 @@ class Addition:
 def check_add(backup: str, arguments: Sequence[str]) -> Addition:
     """Steps 1-5 of add: refuse anything unsafe before measuring. Nothing is written."""
     backup_dir = backup_folder(backup, "add")
-    current = _checked_marker(backup_dir)
+    current = checked_marker(backup_dir)
     added, adopted = check_sources(backup_dir, arguments, "add")
     for source in added:
-        if _too_long(backup_dir / source.name):  # remove could never take it off (R3.5)
+        if too_long(backup_dir / source.name):  # remove could never take it off (R3.5)
             raise Refusal(
-                f"{backup_dir / source.name} would be a path of {_TOO_LONG} characters or more,"
+                f"{backup_dir / source.name} would be a path of {PATH_LIMIT} characters or more,"
                 " too long for syncplan. Pick a shorter name with NAME=SOURCE."
             )
         _check_against_listed(source, current.sources, backup_dir)
@@ -107,7 +103,7 @@ def finish_add(addition: Addition) -> None:
 def remove(backup: str, names: Sequence[str]) -> None:
     """Steps 1-6 of remove (R2, R3). Nothing is written until every check has passed."""
     backup_dir = backup_folder(backup, "remove")
-    current = _checked_marker(backup_dir)
+    current = checked_marker(backup_dir)
     seen: set[str] = set()
     for name in names:  # a repeat first, listed or not (D6)
         if name.lower() in seen:
@@ -140,39 +136,6 @@ def remove(backup: str, names: Sequence[str]) -> None:
                 source.name,
             )
     _report_list(backup_dir, sources, waiting)
-
-
-def _checked_marker(backup_dir: Path) -> Marker:
-    """Step 2: the backup's marker (R4.2, R4.3), with every name in it usable (D12)."""
-    try:
-        current = read_marker(backup_dir)
-    except NotInitialized:
-        raise Refusal(
-            f"{backup_dir} is not a syncplan backup."
-            f" Set it up first with syncplan init {quoted(str(backup_dir))}."
-        ) from None
-    except MarkerError as error:
-        # An OS error behind it gets Details (init-marker R5.2).
-        raise Refusal(str(error)) from error
-    path = marker_path(backup_dir)
-    seen: set[str] = set()
-    for item in (*current.sources, *current.waiting):
-        try:
-            check_name(item.name)
-        except Refusal:
-            raise Refusal(
-                f'{path} lists the name "{item.name}", which syncplan can\'t use; inspect it.'
-            ) from None
-        if item.name.lower() in seen:
-            raise Refusal(f'{path} lists the name "{item.name}" twice; inspect it.')
-        seen.add(item.name.lower())
-    logger.debug(
-        "backup %s: ok (%d sources, %d waiting)",
-        backup_dir,
-        len(current.sources),
-        len(current.waiting),
-    )
-    return current
 
 
 def _check_against_listed(source: Source, listed: Sequence[Source], backup_dir: Path) -> None:
@@ -224,35 +187,17 @@ def _not_listed(name: str, backup_dir: Path, sources: Sequence[Source]) -> str:
 
 
 def _has_copy(folder: Path, backup_dir: Path) -> bool:
-    """D11: True for a plain folder, False when nothing is there; refuses anything else (R3.5).
-
-    One lstat, never exists() or is_dir(): those read any error, even a failing drive, as
-    "missing" (SP6), and the old copy would then drop off the record.
-    """
-    move = f"Move it out of {backup_dir}, then run remove again."
-    if _too_long(folder):
+    """D11: True for a plain folder, False when nothing is there; refuses anything else (R3.5)."""
+    if too_long(folder):
         raise Refusal(
-            f"{folder} is a path of {_TOO_LONG} characters or more,"
-            f" too long for syncplan to check. {move}"
+            f"{folder} is a path of {PATH_LIMIT} characters or more,"
+            f" too long for syncplan to check. Move it out of {backup_dir}, then run remove again."
         )
-    try:
-        info = folder.lstat()
-    except FileNotFoundError, NotADirectoryError:
-        backup_dir.stat()  # the backup drive itself gone? Then that error ends the run (SP6)
-        logger.debug("subfolder %s: missing, so nothing waits", folder)
-        return False
-    if (
-        stat.S_ISDIR(info.st_mode)
-        and not info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
-    ):
+    if plain_folder(folder, backup_dir, "remove", "so it can't wait for the quarantine"):
         logger.debug("subfolder %s: a plain folder, waiting for the quarantine", folder)
         return True
-    raise Refusal(f"{folder} is not a real folder, so it can't wait for the quarantine. {move}")
-
-
-def _too_long(path: Path) -> bool:
-    """R3.5, R5.6: 260 or more UTF-16 units, as Windows counts a path (an emoji is two)."""
-    return len(str(path).encode("utf-16-le")) // 2 >= _TOO_LONG
+    logger.debug("subfolder %s: missing, so nothing waits", folder)
+    return False
 
 
 def _save(

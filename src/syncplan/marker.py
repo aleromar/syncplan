@@ -133,7 +133,10 @@ def write_marker(folder: Path, sources: Sequence[Source]) -> Marker:
     own_dir = folder / MARKER_DIR
     created_dir = not own_dir.exists()
     own_dir.mkdir(exist_ok=True)
-    _swap_in(own_dir, data, lambda temp: temp.rename(marker_path(folder)), created_dir)
+    target = marker_path(folder)
+    write_through_temp(
+        own_dir, _json_text(data), lambda temp: temp.rename(target), created_dir, "marker-"
+    )
     logger.debug("marker written: %s", marker_path(folder))
     return marker
 
@@ -170,22 +173,25 @@ def replace_marker(
             )
         temp.replace(target)
 
-    _swap_in(target.parent, data, check_then_replace, created_dir=False)
+    write_through_temp(target.parent, _json_text(data), check_then_replace, False, "marker-")
     logger.debug("marker replaced: %s", target)
 
 
-def _swap_in(own_dir: Path, data: dict, swap: Callable[[Path], None], created_dir: bool) -> None:
-    """Write data to a new temporary file in own_dir, flushed and closed, then swap it in.
+def write_through_temp(
+    own_dir: Path, text: str, swap: Callable[[Path], None], created_dir: bool, prefix: str
+) -> None:
+    """Write text to a new temporary file in own_dir, flushed and closed, then swap it in.
 
-    If anything fails, the temporary file, and own_dir if this write created it, are
-    removed when possible (R1.6, manage-sources R6.2).
+    The file is UTF-8; a broken character becomes a \\udc80 escape (plan-copies D8). If
+    anything fails, the temporary file, and own_dir if this write created it, are removed
+    when possible (R1.6, manage-sources R6.2).
     """
-    text = json.dumps(data, indent=2) + "\n"
     temp, done = None, False
     try:
-        handle, name = tempfile.mkstemp(prefix="marker-", suffix=".tmp", dir=own_dir)
+        handle, name = tempfile.mkstemp(prefix=prefix, suffix=".tmp", dir=own_dir)
         temp = Path(name)
-        with os.fdopen(handle, "w", encoding="ascii", newline="\n") as file:
+        utf8 = {"encoding": "utf-8", "errors": "backslashreplace", "newline": "\n"}
+        with os.fdopen(handle, "w", **utf8) as file:
             file.write(text)
             file.flush()
             os.fsync(file.fileno())
@@ -193,10 +199,10 @@ def _swap_in(own_dir: Path, data: dict, swap: Callable[[Path], None], created_di
         done = True
     finally:
         if not done:
-            _clean_up([temp] + ([own_dir] if created_dir else []))
+            _clean_up([temp] + ([own_dir] if created_dir else []), prefix.rstrip("-"))
 
 
-def _clean_up(leftovers: list[Path | None]) -> None:
+def _clean_up(leftovers: list[Path | None], what: str) -> None:
     """After a failed write: remove what this write created, and log what stayed (R1.6)."""
     removed, left = [], []
     for path in leftovers:
@@ -208,10 +214,16 @@ def _clean_up(leftovers: list[Path | None]) -> None:
         except OSError as error:
             left.append(f"{path} ({error.strerror or error})")
     logger.debug(
-        "marker write failed; cleanup removed: %s%s",
+        "%s write failed; cleanup removed: %s%s",
+        what,
         ", ".join(removed) or "nothing",
         f"; left: {', '.join(left)}" if left else "",
     )
+
+
+def _json_text(data: dict) -> str:
+    """The marker's text: indented JSON, ASCII only (init-marker D12)."""
+    return json.dumps(data, indent=2) + "\n"
 
 
 def _parse(raw: bytes) -> dict:

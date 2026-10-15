@@ -11,7 +11,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from syncplan import marker
-from syncplan.init import Refusal, check_name, read_argument, subfolder_name
+from syncplan.checks import Refusal, check_name, read_argument, subfolder_name
 from syncplan.marker import Source, read_marker
 
 
