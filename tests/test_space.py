@@ -8,7 +8,7 @@ from conftest import make_tree
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from syncplan import init, space
+from syncplan import space
 from syncplan.space import block_size, folder_size, format_size
 
 KB, MB, GB, TB = 2**10, 2**20, 2**30, 2**40
@@ -281,7 +281,7 @@ def drive(monkeypatch):
 
     def set_drive(capacity: int, free: int) -> list[Path]:
         capacity_free[:] = [capacity, free]
-        monkeypatch.setattr(init, "disk_usage", disk_usage)
+        monkeypatch.setattr(space, "disk_usage", disk_usage)
         monkeypatch.setattr(space, "block_size", fake_block_size)
         return asked
 

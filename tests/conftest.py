@@ -1,6 +1,7 @@
 """Shared test helpers: synthetic folder trees, a CLI runner, junctions and sparse files."""
 
 import ctypes
+import json
 import msvcrt
 import os
 import re
@@ -8,6 +9,7 @@ import stat
 import subprocess
 import sys
 from ctypes import wintypes
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -17,8 +19,22 @@ from syncplan import cli
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 _kernel32.GetCompressedFileSizeW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(wintypes.DWORD)]
 _kernel32.GetCompressedFileSizeW.restype = wintypes.DWORD  # unsigned, or big sizes go negative
+_kernel32.CreateFileW.argtypes = [
+    wintypes.LPCWSTR,
+    wintypes.DWORD,
+    wintypes.DWORD,
+    wintypes.LPVOID,
+    wintypes.DWORD,
+    wintypes.DWORD,
+    wintypes.HANDLE,
+]
+_kernel32.CreateFileW.restype = wintypes.HANDLE
 _FSCTL_SET_SPARSE = 0x000900C4
 _INVALID_FILE_SIZE = 0xFFFFFFFF
+_INVALID_HANDLE = wintypes.HANDLE(-1).value
+_READ_WRITE = 0x80000000 | 0x40000000
+_OPEN_EXISTING = 3
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 _HOLD_LOCK = """
 import msvcrt, os, sys, time
@@ -67,6 +83,43 @@ def tree_snapshot(root: Path) -> dict[str, object]:
             else:
                 snapshot[key] = path.read_bytes()
     return snapshot
+
+
+def file_dates(root: Path) -> dict[str, int]:
+    """The modification date, in ns, of every file, folder and link under root.
+
+    With tree_snapshot, this shows that plan changed no date anywhere (plan-copies R1.2).
+    Links are recorded, not followed.
+    """
+    dates: dict[str, int] = {}
+    pending = [root]
+    while pending:
+        folder = pending.pop()
+        for path in folder.iterdir():
+            dates[path.relative_to(root).as_posix()] = path.lstat().st_mtime_ns
+            if path.is_dir() and not (path.is_symlink() or path.is_junction()):
+                pending.append(path)
+    return dates
+
+
+def read_plan(backup: Path, name: str) -> dict:
+    """The plan file plan wrote for the source NAME, as JSON."""
+    return json.loads((backup / ".syncplan" / "plans" / f"{name}.json").read_text("utf-8"))
+
+
+def plan_date(text: str) -> int:
+    """A plan file's date as ns since 1970 UTC, exactly (plan-copies D8).
+
+    datetime.fromisoformat drops the 7th decimal (SP14), so the fraction is read apart.
+    """
+    whole, fraction = text.removesuffix("Z").split(".")
+    since = datetime.fromisoformat(whole).replace(tzinfo=UTC) - _EPOCH
+    return (since.days * 86_400 + since.seconds) * 1_000_000_000 + int(fraction) * 100
+
+
+def extended(path: Path) -> str:
+    """The \\\\?\\ form of path, which makes names Windows can't normally use (plan-copies SP9)."""
+    return "\\\\?\\" + str(path)
 
 
 def lists_source(report: str, name: str, path: Path) -> bool:
@@ -175,6 +228,23 @@ def run_cli(capsys):
         return code, captured.out, captured.err
 
     return run
+
+
+@pytest.fixture
+def locked():
+    """Hold files open with no sharing at all, as some programs do (plan-copies SP1)."""
+    handles = []
+
+    def lock(path: Path) -> Path:
+        handle = _kernel32.CreateFileW(str(path), _READ_WRITE, 0, None, _OPEN_EXISTING, 0, None)
+        if handle == _INVALID_HANDLE:
+            raise ctypes.WinError(ctypes.get_last_error())
+        handles.append(handle)
+        return path
+
+    yield lock
+    for handle in handles:
+        _kernel32.CloseHandle(handle)
 
 
 @pytest.fixture

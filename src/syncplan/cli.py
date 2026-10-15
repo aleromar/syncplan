@@ -9,7 +9,7 @@ import sys
 from importlib.metadata import version
 from typing import IO
 
-from syncplan import init, log, sources
+from syncplan import checks, init, log, sources
 
 logger = logging.getLogger(__name__)
 _SOURCE_HELP = "folder to back up; write NAME=SOURCE to choose its subfolder name"
@@ -68,7 +68,7 @@ def _run(argv: list[str]) -> int:
         else:
             sources.remove(args.backup, args.names)
         return 0
-    except init.Refusal as refusal:
+    except checks.Refusal as refusal:
         if not _windows_problem(refusal):
             logger.error("%s", refusal)
             return 1

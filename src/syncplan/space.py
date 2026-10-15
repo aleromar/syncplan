@@ -5,10 +5,14 @@ import logging
 import os
 import time
 from pathlib import Path
+from shutil import disk_usage
+
+from syncplan.checks import Setup
 
 logger = logging.getLogger(__name__)
 _kernel32 = ctypes.windll.kernel32
 _DEFAULT_BLOCK = 4096
+_FREE_SHARE = 10  # warn when less than 1/10 of the drive would be left (R2.7)
 _UNITS = ("KB", "MB", "GB", "TB")
 _WHOLE_FROM = 9.95  # sizes that would show as 10.0 or more drop the decimal (design D7)
 
@@ -61,7 +65,7 @@ def folder_size(folder: Path, block: int) -> tuple[int, int]:
                         size = entry.stat(follow_symlinks=False).st_size
                     except OSError:
                         continue
-                    total += (size + block - 1) // block * block
+                    total += rounded(size, block)
                     files += 1
         except OSError as error:
             if current == os.fspath(folder):
@@ -80,6 +84,52 @@ def folder_size(folder: Path, block: int) -> tuple[int, int]:
         elapsed,
     )
     return total, skipped
+
+
+def rounded(size: int, block: int) -> int:
+    """The space a file of size bytes takes: whole blocks (design D5)."""
+    return (size + block - 1) // block * block
+
+
+def measure(setup: Setup) -> tuple[list[int], str, list[str]]:
+    """R2.5-R2.8: each source's size, the space line, and warnings if the drive looks short."""
+    block = block_size(setup.backup)
+    sizes, skipped = [], 0
+    for source in setup.sources:
+        size, missed = folder_size(source.path, block)
+        sizes.append(size)
+        skipped += missed
+    needed = sum(sizes)
+    capacity, _, free = disk_usage(setup.backup)
+    drive = setup.backup.anchor
+    logger.debug("drive %s: capacity %s, free %s", drive, format_size(capacity), format_size(free))
+    line = f"Space needed: about {format_size(needed)}. {drive} has {format_size(free)} free."
+    if skipped == 1:
+        line += " (1 folder couldn't be read and isn't counted)"
+    elif skipped:
+        line += f" ({skipped} folders couldn't be read and aren't counted)"
+    warnings = []
+    if needed > free:
+        warnings.append(
+            f"Warning: about {format_size(needed - free)} short."
+            " The first apply will stop before copying unless you free space."
+        )
+        for folder in setup.adopted:
+            try:
+                copy = format_size(folder_size(folder, block)[0])
+            except OSError:
+                copy = "size unknown"
+            warnings.append(
+                f"An existing copy in {folder} ({copy}) may cover part of this;"
+                " the first plan gives the exact figure."
+            )
+    elif (left := free - needed) * _FREE_SHARE < capacity:
+        warnings.append(
+            f"Note: after the first backup only {format_size(left)} ({left * 100 // capacity}%)"
+            f" of {drive} would be free. Overwritten and deleted files are kept in quarantine"
+            " on this drive, so it may fill up."
+        )
+    return sizes, line, warnings
 
 
 def format_size(size: int) -> str:

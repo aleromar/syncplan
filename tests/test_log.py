@@ -78,7 +78,7 @@ def old_logs(program_data: Path) -> list[bytes | None]:
 @pytest.fixture
 def short_drive(monkeypatch):
     """A backup drive with almost no free space, so R2.6 warns."""
-    monkeypatch.setattr(init, "disk_usage", lambda path: (100 * 2**20, 100 * 2**20 - 10, 10))
+    monkeypatch.setattr(space, "disk_usage", lambda path: (100 * 2**20, 100 * 2**20 - 10, 10))
 
 
 # R5.1 Every run is recorded

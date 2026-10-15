@@ -12,7 +12,7 @@ from conftest import lists_source, make_backup, make_tree, marker_names, tree_sn
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from syncplan import cli, init, marker, space
+from syncplan import cli, marker, space
 from syncplan.marker import Source, read_marker
 
 MARKER = ".syncplan/marker.json"
@@ -149,7 +149,7 @@ def test_r1_3_added_sources_that_do_not_fit_are_warned_about(
 ):
     backup, _ = make_backup(run_cli, tmp_path, "Photos")
     sparse_file(music / "big.iso", 5 * 2**30)
-    monkeypatch.setattr(init, "disk_usage", lambda path: (100 * 2**30, 99 * 2**30, 2**30))
+    monkeypatch.setattr(space, "disk_usage", lambda path: (100 * 2**30, 99 * 2**30, 2**30))
 
     code, out, err = run_cli("add", backup, music)
 
