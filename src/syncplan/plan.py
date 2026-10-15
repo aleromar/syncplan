@@ -26,13 +26,14 @@ from syncplan.checks import (
     source_lines,
     too_long,
 )
-from syncplan.compare import Action, Comparison, Seen, compare, key
+from syncplan.compare import Action, Comparison, Decision, Seen, compare, key
 from syncplan.marker import MARKER_DIR, Source, has_marker, write_through_temp
 from syncplan.space import format_size, rounded
 
 logger = logging.getLogger(__name__)
 FORMAT = 1
 FOLDER_LIMIT = 248  # Windows can't make a folder whose path is this long (SP4)
+SHOWN = 50  # items per list on screen; the plan file has them all (R5.4)
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _NS = 1_000_000_000
 
@@ -119,8 +120,8 @@ def _plan_text(target: Target, quick: bool, result: Comparison) -> str:
     }
     lists = {
         "actions": [_action_entry(action) for action in result.actions],
-        "chosen": [],
-        "decide": [],
+        "chosen": [_decision_entry(decision) for decision in result.chosen],
+        "decide": [_decision_entry(decision) for decision in result.decide],
         "skipped": [],
     }
     parts = [f"  {_json(name)}: {_json(value)}" for name, value in fields.items()]
@@ -135,6 +136,18 @@ def _action_entry(action: Action) -> dict:
     for side, seen in (("source", action.source), ("backup", action.backup)):
         if seen is not None:
             entry[side] = _seen_entry(seen)
+    return entry
+
+
+def _decision_entry(decision: Decision) -> dict:
+    entry = {
+        "path": decision.path,
+        "case": decision.case,
+        "source": _seen_entry(decision.source),
+        "backup": _seen_entry(decision.backup),
+    }
+    if decision.reason:
+        entry["reason"] = decision.reason
     return entry
 
 
@@ -180,6 +193,16 @@ def _report(target: Target, quick: bool, result: Comparison) -> None:
             "Warning: about %s short. Apply will stop before copying unless you free space.",
             format_size(needed - free),
         )
+    _listed(
+        logging.INFO,
+        "Overwriting, as you chose (the old copies go to the quarantine):",
+        [_decision_lines(decision) for decision in result.chosen],
+    )
+    _listed(
+        logging.WARNING,
+        "Needs your decision (nothing planned for these):",
+        [_decision_lines(decision) for decision in result.decide],
+    )
     if result.extra_files or result.extra_folders:
         logger.info(
             "On the backup but no longer in %s: %s, %s (left as they are for now).",
@@ -187,13 +210,43 @@ def _report(target: Target, quick: bool, result: Comparison) -> None:
             _count(result.extra_files, "file"),
             _count(result.extra_folders, "folder"),
         )
-    if not result.actions:
+    if not (result.actions or result.decide):
         logger.info("Nothing to do: %s is up to date.", target.copy)
     logger.info("Plan written to %s", target.plan_file)
     logger.info("Nothing has been changed.")
 
 
 _KINDS = ("copy", "overwrite", "set date", "make folder")
+
+
+def _listed(level: int, heading: str, items: list[list[str]]) -> None:
+    """R5.4: a heading and up to SHOWN items; the rest go to the log only (NFR2)."""
+    if not items:
+        return
+    logger.log(level, "%s", heading)
+    for number, lines in enumerate(items):
+        for line in lines:
+            logger.log(level if number < SHOWN else logging.DEBUG, "%s", line)
+    if len(items) > SHOWN:
+        more = f"{len(items) - SHOWN:,}"
+        logger.log(level, "  ... and %s more (all in the plan file)", more)
+
+
+def _decision_lines(decision: Decision) -> list[str]:
+    case = f"{decision.case}: {decision.reason}" if decision.reason else decision.case
+    sides = " | ".join(
+        f"{side} {_shown(seen.date)}  {format_size(seen.size)}"
+        for side, seen in (("source", decision.source), ("backup", decision.backup))
+    )
+    return [f"  {decision.path}  {case}", f"    {sides}"]
+
+
+def _shown(date: int) -> str:
+    """A date on screen: local time to the second, or UTC where Windows can't (SP10)."""
+    try:
+        return f"{datetime.fromtimestamp(date // _NS):%d %b %Y %H:%M:%S}"
+    except OSError, OverflowError, ValueError:
+        return f"{_EPOCH + timedelta(seconds=date // _NS):%d %b %Y %H:%M:%S} UTC"
 
 
 def _size(actions: list[Action]) -> str:

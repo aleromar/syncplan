@@ -3,6 +3,7 @@
 import json
 import os
 import shutil
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -14,8 +15,10 @@ from conftest import (
     read_plan,
     tree_snapshot,
 )
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
-from syncplan import compare, marker, space
+from syncplan import cli, compare, marker, space
 
 MARKER = ".syncplan/marker.json"
 T0 = 1_760_000_000_123_456_700  # a date with a 100-ns digit (SP3)
@@ -56,12 +59,17 @@ def opened(monkeypatch) -> list[Path]:
     return seen
 
 
-def refuses(run_cli, root: Path, *args: object, expected: tuple[str, ...] = ()) -> str:
-    """Run plan and assert a refusal that changed nothing under root (R1.2). Returns stderr."""
+def refuses(
+    run_cli, root: Path, *args: object, expected: tuple[str, ...] = (), listed: bool = False
+) -> str:
+    """Run plan and assert a refusal that changed nothing under root (R1.2). Returns stderr.
+
+    listed: the refusal comes after listing and reading, which print progress lines.
+    """
     before = tree_snapshot(root), file_dates(root)
     code, out, err = run_cli("plan", *args)
     assert code == 1, err
-    assert out == ""
+    assert listed or out == ""
     for text in expected:
         assert text in err
     assert (tree_snapshot(root), file_dates(root)) == before
@@ -744,3 +752,195 @@ def test_nfr2_listing_and_reading_times_are_logged(tmp_path, run_cli, copied, pr
     assert f"listed {source} and {backup / 'Photos'}:" in log
     assert "read 2 pairs" in log
     assert f"plan written: {backup / '.syncplan' / 'plans' / 'Photos.json'}" in log
+
+
+# R3: files that need your decision
+
+
+def decided(plan: dict) -> list[tuple[str, str]]:
+    return [(entry["path"], entry["case"]) for entry in plan["decide"]]
+
+
+@pytest.mark.parametrize(
+    ("content", "date", "case"),
+    [
+        ("bee, other", T1, "same date, other size"),
+        ("BEE", T1, "same date and size, different content"),
+        ("bee, other", T2, "backup copy newer"),
+        ("BEE", T2, "backup copy newer"),
+        ("bee", T2, None),  # same content, newer: only the date (R2.5)
+    ],
+)
+def test_r3_1_a_difference_that_is_no_edit_needs_a_decision(
+    tmp_path, run_cli, copied, content, date, case
+):
+    backup, source, copy = copied
+    put(copy / "b.txt", content, date)
+    out, err, plan = planned(run_cli, backup, source)
+    if case is None:
+        assert actions(plan) == [("set date", "b.txt")]
+        assert plan["decide"] == []
+        return
+    assert plan["actions"] == []
+    assert decided(plan) == [("b.txt", case)]
+    entry = plan["decide"][0]
+    assert entry["source"]["size"] == 3
+    assert entry["backup"]["size"] == len(content)
+    assert plan_date(entry["backup"]["date"]) == date
+    assert "Needs your decision (nothing planned for these):" in err
+    assert f"  b.txt  {case}" in err
+    assert err.count(" | backup ") == 1
+    assert "Nothing to do" not in out  # R4.3: a decision is not "up to date"
+
+
+def test_r3_1_a_quick_plan_finds_a_newer_backup_copy_but_not_different_bytes(
+    tmp_path, run_cli, copied
+):
+    backup, source, copy = copied
+    put(copy / "b.txt", "BEE", T1)  # same size and date: unchanged to a quick plan
+    put(copy / "a" / "1.jpg", "one", T1)  # the backup's copy is newer
+    _, _, plan = planned(run_cli, backup, source, "--quick")
+    assert decided(plan) == [("a\\1.jpg", "backup copy newer")]
+
+
+def test_r1_1_and_r4_2_a_plan_with_only_a_decision_exits_0(tmp_path, run_cli, copied):
+    backup, source, copy = copied
+    put(copy / "b.txt", "BEE", T1)
+    code, out, _ = run_cli("plan", backup, source)
+    assert code == 0
+    assert "Nothing to do" not in out
+    assert read_plan(backup, "Photos")["decide"][0]["case"] == (
+        "same date and size, different content"
+    )
+
+
+def test_r3_2_overwrite_turns_a_decision_into_an_overwrite_shown_as_chosen(
+    tmp_path, run_cli, copied
+):
+    backup, source, copy = copied
+    put(copy / "b.txt", "BEE", T1)
+    put(copy / "a" / "1.jpg", "one!", T2)
+    out, err, plan = planned(run_cli, backup, source, "--overwrite", source / "b.txt")
+    assert actions(plan) == [("overwrite", "b.txt")]
+    assert [entry["path"] for entry in plan["chosen"]] == ["b.txt"]
+    assert decided(plan) == [("a\\1.jpg", "backup copy newer")]
+    assert "Overwriting, as you chose (the old copies go to the quarantine):" in out
+    assert "  b.txt  same date and size, different content" in out
+    assert "b.txt" not in err
+
+
+def test_nfr1_overwrite_typed_in_another_case_is_accepted(
+    tmp_path, run_cli, copied, typed_case_kept
+):
+    backup, source, copy = copied
+    put(copy / "b.txt", "BEE", T1)
+    _, _, plan = planned(run_cli, backup, source, "--overwrite", str(source / "b.txt").upper())
+    assert actions(plan) == [("overwrite", "b.txt")]
+
+
+def test_r3_3_overwrite_of_a_file_needing_no_decision_is_refused_before_the_long_read(
+    tmp_path, run_cli, copied, opened
+):
+    backup, source, copy = copied
+    put(source / "c.txt", "sea")
+    shutil.copy2(source / "c.txt", copy / "c.txt")
+    err = refuses(
+        run_cli,
+        tmp_path,
+        backup,
+        source,
+        "--overwrite",
+        source / "c.txt",
+        expected=(
+            f"{source / 'c.txt'} doesn't need a decision; --overwrite only takes files"
+            ' listed under "Needs your decision".',
+        ),
+        listed=True,
+    )
+    assert opened == [source / "c.txt", copy / "c.txt"]  # its pair alone, read first
+    assert "Details" not in err
+
+
+def test_r3_4_a_backup_file_that_cannot_be_read_needs_a_decision(
+    tmp_path, run_cli, copied, monkeypatch
+):
+    backup, source, copy = copied
+    real = compare._open_shared
+
+    def damaged(path):
+        if Path(path) == copy / "b.txt":
+            raise OSError(22, "Data error (cyclic redundancy check)", str(path), 23)
+        return real(path)
+
+    monkeypatch.setattr(compare, "_open_shared", damaged)
+    _, err, plan = planned(run_cli, backup, source)
+    assert decided(plan) == [("b.txt", "backup copy can't be read")]
+    assert plan["decide"][0]["reason"] == "Data error (cyclic redundancy check)"
+    assert "b.txt  backup copy can't be read: Data error (cyclic redundancy check)" in err
+
+    _, _, plan = planned(run_cli, backup, source, "--overwrite", source / "b.txt")
+    assert actions(plan) == [("overwrite", "b.txt")]
+
+
+def test_r5_4_long_lists_stop_at_50_lines_and_the_plan_file_has_all(tmp_path, run_cli, copied):
+    backup, source, copy = copied
+    for number in range(55):
+        put(source / "many" / f"{number:02}.txt", "x", T0)
+        put(copy / "many" / f"{number:02}.txt", "y", T1)
+    _, err, plan = planned(run_cli, backup, source)
+    assert len(plan["decide"]) == 55
+    assert plan["decide"][50]["path"] == "many\\50.txt"
+    assert err.count("backup copy newer") == 50
+    assert "  ... and 5 more (all in the plan file)" in err
+
+
+# The plan, applied, leaves nothing to do (D12, R2, R3.1)
+
+NAMES = ["a", "b", "c", "d\\e", "d\\f"]
+DATES = [T0, T0 + 100, T1, -2_592_000_000_000_000 + 1_234_567_800]  # one in 1969
+CONTENTS = [b"", b"x", b"xy", b"xz", b"xyz"]
+FILES = st.dictionaries(
+    st.sampled_from(NAMES),
+    st.tuples(st.sampled_from(CONTENTS), st.sampled_from(DATES)),
+    max_size=5,
+)
+
+
+def apply_plan(plan: dict, source: Path, copy: Path) -> None:
+    """A reference apply, for the test only: paths and dates come from the plan file."""
+    for action in plan["actions"]:
+        target = copy / action["path"]
+        if action["do"] == "make folder":
+            target.mkdir()
+            continue
+        if action["do"] in ("copy", "overwrite"):
+            shutil.copyfile(source / action["path"], target)
+        date = plan_date(action["source"]["date"])
+        os.utime(target, ns=(date, date))
+
+
+@settings(max_examples=25, deadline=None)
+@given(mine=FILES, theirs=FILES)
+def test_property_a_plan_applied_leaves_nothing_to_do(mine, theirs):
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        source, backup = root / "src" / "Photos", root / "backup"
+        for files, folder in ((mine, source), (theirs, backup / "Photos")):
+            folder.mkdir(parents=True)
+            for name, (content, date) in files.items():
+                put(folder / name, content, date)
+        assert cli.main(["init", str(backup), str(source)]) == 0
+        assert cli.main(["plan", str(backup), str(source)]) == 0
+        first = read_plan(backup, "Photos")
+
+        acted = {a["path"] for a in first["actions"] if a["do"] != "make folder"}
+        decide = {entry["path"] for entry in first["decide"]}
+        assert not acted & decide
+        for name in mine.keys() - acted - decide:  # the rest are exact copies already
+            assert theirs.get(name) == mine[name]
+
+        apply_plan(first, source, backup / "Photos")
+        assert cli.main(["plan", str(backup), str(source)]) == 0
+        second = read_plan(backup, "Photos")
+        assert second["actions"] == []
+        assert decided(second) == decided(first)

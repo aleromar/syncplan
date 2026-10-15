@@ -15,10 +15,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from time import monotonic
 
+from syncplan.checks import Refusal
 from syncplan.space import format_size
 
 logger = logging.getLogger(__name__)
 CHUNK = 1 << 20  # bytes read at a time from each file (D4)
+SAME_DATE = "same date, other size"  # the cases of R3.1 and R3.4
+DIFFERENT = "same date and size, different content"
+NEWER = "backup copy newer"
+UNREADABLE = "backup copy can't be read"
 
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 _kernel32.CreateFileW.argtypes = [
@@ -54,9 +59,22 @@ class Action:
     backup: Seen | None = None
 
 
+@dataclass(frozen=True)
+class Decision:
+    """A file that differs in a way no edit explains: the user decides (R3.1, R3.4)."""
+
+    path: str
+    case: str
+    source: Seen
+    backup: Seen
+    reason: str = ""  # Windows' reason, for an unreadable backup copy
+
+
 @dataclass
 class Comparison:
     actions: list[Action] = field(default_factory=list)
+    decide: list[Decision] = field(default_factory=list)
+    chosen: list[Decision] = field(default_factory=list)  # turned into overwrites (R3.2)
     unchanged: int = 0
     extra_files: int = 0  # only in the copy (R2.7)
     extra_folders: int = 0
@@ -82,6 +100,14 @@ class _Pair:
     seen_backup: Seen
 
 
+class _Unreadable(Exception):
+    """Reading one side of a pair failed; side is "source" or "backup"."""
+
+    def __init__(self, side: str, error: OSError) -> None:
+        super().__init__(side)
+        self.side, self.error = side, error
+
+
 def key(path: str) -> str:
     """An entry's key: its path inside the source, lower-cased as Windows compares (NFR1)."""
     return path.lower()
@@ -89,7 +115,7 @@ def key(path: str) -> str:
 
 def compare(source: Path, copy: Path, quick: bool, overwrite: Mapping[str, Path]) -> Comparison:
     """Walk the source and its copy, then read the same-size pairs (steps 7-9)."""
-    walk = _Walk(source, copy, quick)
+    walk = _Walk(source, copy, quick, overwrite)
     logger.info("Listing %s and %s...", source, copy)
     started = monotonic()
     if _exists(copy):
@@ -109,8 +135,8 @@ def compare(source: Path, copy: Path, quick: bool, overwrite: Mapping[str, Path]
 
 
 class _Walk:
-    def __init__(self, source: Path, copy: Path, quick: bool) -> None:
-        self.source, self.copy, self.quick = source, copy, quick
+    def __init__(self, source: Path, copy: Path, quick: bool, overwrite: Mapping[str, Path]):
+        self.source, self.copy, self.quick, self.overwrite = source, copy, quick, overwrite
         self.result = Comparison()
         self.pairs: list[_Pair] = []
 
@@ -139,17 +165,19 @@ class _Walk:
                 self.pairs.append(pair)
 
     def read_pairs(self) -> None:
-        """Step 9: read each pair once, comparing it byte for byte (R2.4, D4)."""
-        if not self.pairs:
-            return
+        """Steps 8-9: read each pair once, byte for byte (R2.4, D4); --overwrite's first (D3)."""
         total = sum(pair.seen_source.size for pair in self.pairs)
-        logger.info(
-            "Reading %s files to compare (%s)...", f"{len(self.pairs):,}", format_size(total)
-        )
+        if self.pairs:
+            count = f"{len(self.pairs):,}"
+            logger.info("Reading %s files to compare (%s)...", count, format_size(total))
         started = monotonic()
+        chosen = [pair for pair in self.pairs if key(pair.path) in self.overwrite]
+        for pair in chosen:
+            self._read(pair)
+        self._check_chosen()
         for pair in self.pairs:
-            same = _same_bytes(pair.source, pair.backup)
-            self._sort(pair.path, pair.seen_source, pair.seen_backup, same)
+            if key(pair.path) not in self.overwrite:
+                self._read(pair)
         logger.debug(
             "read %d pairs (%s) in %.2f s",
             len(self.pairs),
@@ -157,14 +185,50 @@ class _Walk:
             monotonic() - started,
         )
 
+    def _read(self, pair: _Pair) -> None:
+        try:
+            same = _same_bytes(pair.source, pair.backup)
+        except _Unreadable as unreadable:
+            if unreadable.side != "backup":
+                raise unreadable.error from None
+            reason = unreadable.error.strerror or str(unreadable.error)
+            decision = Decision(pair.path, UNREADABLE, pair.seen_source, pair.seen_backup, reason)
+            self._decide(decision)
+            return
+        self._sort(pair.path, pair.seen_source, pair.seen_backup, same)
+
     def _sort(self, path: str, source: Seen, backup: Seen, same: bool) -> None:
-        """R2.3, R2.5: what a file on both sides needs."""
+        """R2.3, R2.5, R3.1: what a file on both sides needs."""
         if same and source.date == backup.date:
             self.result.unchanged += 1
         elif same:
             self.result.actions.append(Action("set date", path, source, backup))
         elif source.date > backup.date:
             self.result.actions.append(Action("overwrite", path, source, backup))
+        elif source.date == backup.date:
+            case = DIFFERENT if source.size == backup.size else SAME_DATE
+            self._decide(Decision(path, case, source, backup))
+        else:
+            self._decide(Decision(path, NEWER, source, backup))
+
+    def _decide(self, decision: Decision) -> None:
+        """R3.1, R3.2: list it for the user, or overwrite it as --overwrite chose."""
+        if key(decision.path) not in self.overwrite:
+            self.result.decide.append(decision)
+            return
+        self.result.chosen.append(decision)
+        overwrite = Action("overwrite", decision.path, decision.source, decision.backup)
+        self.result.actions.append(overwrite)
+
+    def _check_chosen(self) -> None:
+        """R3.3: every --overwrite file must be one this plan lists as needing a decision."""
+        chosen = {key(decision.path) for decision in self.result.chosen}
+        for entry_key, path in self.overwrite.items():
+            if entry_key not in chosen:
+                raise Refusal(
+                    f"{path} doesn't need a decision; --overwrite only takes files listed"
+                    ' under "Needs your decision".'
+                )
 
     def _extra(self, entry: _Entry, path: Path) -> None:
         """R2.7: count what is only in the copy, folders with everything in them."""
@@ -190,14 +254,25 @@ def _listing(folder: Path) -> dict[str, _Entry]:
 
 
 def _same_bytes(source: Path, backup: Path) -> bool:
-    """True if the two files hold the same bytes, read in chunks to the first difference."""
-    with _open_shared(source) as mine, _open_shared(backup) as theirs:
-        while True:
-            chunk = mine.read(CHUNK)
-            if chunk != theirs.read(CHUNK):
-                return False
-            if not chunk:
-                return True
+    """True if the two files hold the same bytes, read in chunks to the first difference.
+
+    A failure is raised as _Unreadable, naming the side that failed (R2.8, R3.4).
+    """
+    side = "source"
+    try:
+        with _open_shared(source) as mine:
+            side = "backup"
+            with _open_shared(backup) as theirs:
+                while True:
+                    side = "source"
+                    chunk = mine.read(CHUNK)
+                    side = "backup"
+                    if chunk != theirs.read(CHUNK):
+                        return False
+                    if not chunk:
+                        return True
+    except OSError as error:
+        raise _Unreadable(side, error) from error
 
 
 def _open_shared(path: Path):
