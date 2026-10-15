@@ -5,10 +5,12 @@ replaces the previous plan for that source in one step (plan-copies D8).
 """
 
 import dataclasses
+import json
 import logging
 import stat
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from syncplan import space
@@ -24,11 +26,15 @@ from syncplan.checks import (
     source_lines,
     too_long,
 )
-from syncplan.compare import key
-from syncplan.marker import MARKER_DIR, Source, has_marker
+from syncplan.compare import Action, Comparison, Seen, compare, key
+from syncplan.marker import MARKER_DIR, Source, has_marker, write_through_temp
+from syncplan.space import format_size, rounded
 
 logger = logging.getLogger(__name__)
+FORMAT = 1
 FOLDER_LIMIT = 248  # Windows can't make a folder whose path is this long (SP4)
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+_NS = 1_000_000_000
 
 
 @dataclass(frozen=True)
@@ -76,6 +82,126 @@ def check_plan(backup: str, source: str, overwrite: Sequence[str]) -> Target:
         chosen_path = _chosen(text, path)
         chosen[key(str(chosen_path.relative_to(path)))] = chosen_path
     return dataclasses.replace(target, overwrite=chosen)
+
+
+def finish_plan(target: Target, quick: bool) -> None:
+    """Steps 7-11: compare, write the plan file, then report (R1.1, R4, R5)."""
+    result = compare(target.source.path, target.copy, quick, target.overwrite)
+    _write(target, _plan_text(target, quick, result))
+    _report(target, quick, result)
+
+
+def _write(target: Target, text: str) -> None:
+    """R4.1, R4.4, R4.5: replace the plan file in one step, or keep the previous one."""
+    plans = target.plan_file.parent
+    try:
+        try:
+            plans.mkdir()
+            made = True
+        except FileExistsError:
+            made = False
+        write_through_temp(plans, text, lambda temp: temp.replace(target.plan_file), made, "plan-")
+    except OSError as error:
+        reason = error.strerror or str(error)
+        raise Refusal(f"Couldn't write the plan in {plans}: {reason}.") from error
+    logger.debug("plan written: %s", target.plan_file)
+
+
+def _plan_text(target: Target, quick: bool, result: Comparison) -> str:
+    """The plan file: JSON with every entry of its lists on a line of its own (D8)."""
+    fields = {
+        "syncplan_plan": FORMAT,
+        "created": datetime.now().astimezone().replace(microsecond=0).isoformat(),
+        "backup": str(target.backup),
+        "name": target.source.name,
+        "source": str(target.source.path),
+        "quick": quick,
+    }
+    lists = {
+        "actions": [_action_entry(action) for action in result.actions],
+        "chosen": [],
+        "decide": [],
+        "skipped": [],
+    }
+    parts = [f"  {_json(name)}: {_json(value)}" for name, value in fields.items()]
+    for name, entries in lists.items():
+        inner = ",\n".join(f"    {_json(entry)}" for entry in entries)
+        parts.append(f"  {_json(name)}: [\n{inner}\n  ]" if entries else f"  {_json(name)}: []")
+    return "{\n" + ",\n".join(parts) + "\n}\n"
+
+
+def _action_entry(action: Action) -> dict:
+    entry: dict = {"do": action.do, "path": action.path}
+    for side, seen in (("source", action.source), ("backup", action.backup)):
+        if seen is not None:
+            entry[side] = _seen_entry(seen)
+    return entry
+
+
+def _seen_entry(seen: Seen) -> dict:
+    return {"size": seen.size, "date": _plan_date(seen.date)}
+
+
+def _plan_date(date: int) -> str:
+    """A date in UTC with 7 decimals: exact to NTFS's 100 ns, before 1970 too (D8, SP10)."""
+    seconds, rest = divmod(date, _NS)
+    return f"{_EPOCH + timedelta(seconds=seconds):%Y-%m-%dT%H:%M:%S}.{rest // 100:07d}Z"
+
+
+def _json(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def _report(target: Target, quick: bool, result: Comparison) -> None:
+    """R5.1-R5.3: the counts, the space to copy, and where the plan is."""
+    logger.info("Plan for %s (%s -> %s):", target.source.name, target.source.path, target.copy)
+    if quick:
+        logger.info("Quick plan: sizes and dates only; damaged files can't be spotted.")
+    done = {kind: [a for a in result.actions if a.do == kind] for kind in _KINDS}
+    rows = [
+        ("copy (new)", len(done["copy"]), "file", _size(done["copy"])),
+        ("overwrite", len(done["overwrite"]), "file", _size(done["overwrite"])),
+        ("set date", len(done["set date"]), "file", ""),
+        ("make folder", len(done["make folder"]), "folder", ""),
+        ("unchanged", result.unchanged, "file", ""),
+    ]
+    width = max(len(f"{count:,}") for _, count, _, _ in rows)
+    for label, count, unit, size in rows:
+        units = unit if count == 1 else f"{unit}s"
+        logger.info("%s", f"  {label:<12}{count:>{width},} {units:<7}  {size}".rstrip())
+    copied = [action.source.size for action in done["copy"] + done["overwrite"]]
+    block = space.block_size(target.backup)
+    needed = sum(rounded(size, block) for size in copied)
+    free = space.disk_usage(target.backup)[2]
+    drive = target.backup.anchor
+    logger.info("To copy: %s. %s has %s free.", format_size(needed), drive, format_size(free))
+    if needed > free:
+        logger.warning(
+            "Warning: about %s short. Apply will stop before copying unless you free space.",
+            format_size(needed - free),
+        )
+    if result.extra_files or result.extra_folders:
+        logger.info(
+            "On the backup but no longer in %s: %s, %s (left as they are for now).",
+            target.source.path,
+            _count(result.extra_files, "file"),
+            _count(result.extra_folders, "folder"),
+        )
+    if not result.actions:
+        logger.info("Nothing to do: %s is up to date.", target.copy)
+    logger.info("Plan written to %s", target.plan_file)
+    logger.info("Nothing has been changed.")
+
+
+_KINDS = ("copy", "overwrite", "set date", "make folder")
+
+
+def _size(actions: list[Action]) -> str:
+    return format_size(sum(action.source.size for action in actions))
+
+
+def _count(count: int, unit: str) -> str:
+    return f"{count:,} {unit}" if count == 1 else f"{count:,} {unit}s"
 
 
 def _check_there(target: Target) -> None:
