@@ -1,4 +1,4 @@
-"""How much space the sources need on the backup drive (R2.5-R2.8)."""
+"""The backup drive: how much space the sources need (R2.5-R2.8), and its format."""
 
 import ctypes
 import logging
@@ -10,7 +10,8 @@ from shutil import disk_usage
 from syncplan.checks import Setup
 
 logger = logging.getLogger(__name__)
-_kernel32 = ctypes.windll.kernel32
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_BUFFER = 300  # characters: a volume's root path, or its format's name
 _DEFAULT_BLOCK = 4096
 _FREE_SHARE = 10  # warn when less than 1/10 of the drive would be left (R2.7)
 _UNITS = ("KB", "MB", "GB", "TB")
@@ -40,6 +41,21 @@ def block_size(folder: Path) -> int:
         return size
     logger.debug("block size of %s: assumed %d bytes (Windows didn't say)", folder, _DEFAULT_BLOCK)
     return _DEFAULT_BLOCK
+
+
+def filesystem(folder: Path) -> tuple[str, str]:
+    """The root of the volume holding folder, and its format: ("E:\\", "NTFS") (plan-copies D9).
+
+    The volume is looked up from the folder, so a drive mounted in a folder counts as itself.
+    """
+    root = ctypes.create_unicode_buffer(_BUFFER)
+    kind = ctypes.create_unicode_buffer(_BUFFER)
+    if not _kernel32.GetVolumePathNameW(str(folder), root, _BUFFER) or not (
+        _kernel32.GetVolumeInformationW(root.value, None, 0, None, None, None, kind, _BUFFER)
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    logger.debug("drive %s: formatted as %s", root.value, kind.value)
+    return root.value, kind.value
 
 
 def folder_size(folder: Path, block: int) -> tuple[int, int]:

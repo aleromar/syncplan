@@ -299,11 +299,14 @@ def _backup_as_source(
     """init-marker R3.6: name the backup that holds the source, and suggest its own sources instead.
 
     Returns the message, and the marker check's error when the marker couldn't be read.
+    plan takes one listed source, so it gets no suggestion (plan-copies R7.5).
     """
     if path == outer:
         intro = f"{outer} is a syncplan backup."
     else:
         intro = f"{path} is inside the syncplan backup {outer}."
+    if command == "plan":
+        return f"{intro} A backup can't be backed up.", None
     try:
         sources = read_marker(outer).sources
     except MarkerError as error:

@@ -9,7 +9,7 @@ import sys
 from importlib.metadata import version
 from typing import IO
 
-from syncplan import checks, init, log, sources
+from syncplan import checks, init, log, plan, sources
 
 logger = logging.getLogger(__name__)
 _SOURCE_HELP = "folder to back up; write NAME=SOURCE to choose its subfolder name"
@@ -65,6 +65,9 @@ def _run(argv: list[str]) -> int:
             addition = sources.check_add(args.backup, args.sources)
             logger.info("Measuring sources...")
             sources.finish_add(addition)
+        elif args.command == "plan":
+            target = plan.check_plan(args.backup, args.source, args.overwrite)
+            plan.finish_plan(target, args.quick)
         else:
             sources.remove(args.backup, args.names)
         return 0
@@ -129,6 +132,27 @@ def _parser() -> argparse.ArgumentParser:
     remove_parser.add_argument("backup", metavar="BACKUP", help="an existing syncplan backup")
     remove_parser.add_argument(
         "names", metavar="NAME", nargs="+", help="subfolder name of a source, as listed"
+    )
+    plan_parser = commands.add_parser(
+        "plan",
+        help="plan what would bring a source's copy on a backup up to date",
+        description="Compare a source folder with its copy on a syncplan backup, and write a"
+        " plan of the copies, overwrites and date fixes that would bring the copy up to date."
+        " Only the plan file is written.",
+    )
+    plan_parser.add_argument("backup", metavar="BACKUP", help="an existing syncplan backup")
+    plan_parser.add_argument("source", metavar="SOURCE", help="one of its source folders")
+    plan_parser.add_argument(
+        "--quick",
+        action="store_true",
+        help="compare sizes and dates only, reading no file; damaged files can't be spotted",
+    )
+    plan_parser.add_argument(
+        "--overwrite",
+        metavar="FILE",
+        nargs="+",
+        default=[],
+        help='files listed under "Needs your decision" to overwrite on the backup',
     )
     return parser
 
