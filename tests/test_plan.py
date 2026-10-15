@@ -1,7 +1,11 @@
 """plan-copies: `syncplan plan` compares a source with its copy and writes a plan of copies."""
 
+import contextlib
+import ctypes
+import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -12,6 +16,7 @@ import pytest
 from conftest import (
     extended,
     file_dates,
+    hand_written,
     make_backup,
     make_tree,
     plan_date,
@@ -79,16 +84,6 @@ def refuses(
     return err
 
 
-def hand_written(backup: Path, sources) -> None:
-    """A marker written by hand: (name, path) pairs, paths taken as they are."""
-    data = {
-        "syncplan_marker": 1,
-        "created": "2026-10-08T16:40:00+02:00",
-        "sources": [{"name": name, "path": str(path)} for name, path in sources],
-    }
-    make_tree(backup, {MARKER: json.dumps(data)})
-
-
 @pytest.fixture
 def photos(tmp_path, run_cli) -> tuple[Path, Path]:
     """An initialized backup tmp_path/backup of one source, tmp_path/src/Photos."""
@@ -137,7 +132,10 @@ def test_r7_1_plans_folder_that_is_a_file_is_refused(tmp_path, run_cli, photos):
         tmp_path,
         backup,
         source,
-        expected=(f"{backup / '.syncplan' / 'plans'} is not a real folder", "run plan again"),
+        expected=(
+            f"{backup / '.syncplan' / 'plans'} is not a real folder.",
+            "Remove it, then run plan again.",
+        ),
     )
 
 
@@ -146,6 +144,19 @@ def test_r7_1_plans_folder_that_is_a_link_is_refused(tmp_path, run_cli, photos, 
     make_tree(tmp_path, {"elsewhere": None})
     junction(backup / ".syncplan" / "plans", tmp_path / "elsewhere")
     refuses(run_cli, tmp_path, backup, source, expected=("is not a real folder",))
+
+
+def test_r7_1_a_plain_folder_inside_a_backup_is_refused_as_inside(tmp_path, run_cli):
+    # Checked before the marker, so the message doesn't send the user to init (I1).
+    make_tree(tmp_path, {"src/Photos/a.txt": "a", "outer/inner": None})
+    hand_written(tmp_path / "outer", [("Other", tmp_path / "src" / "Other")])
+    refuses(
+        run_cli,
+        tmp_path,
+        tmp_path / "outer" / "inner",
+        tmp_path / "src" / "Photos",
+        expected=("is inside the syncplan backup",),
+    )
 
 
 def test_r7_1_backup_inside_another_backup_is_refused(tmp_path, run_cli):
@@ -250,9 +261,14 @@ def test_r7_4_missing_source_is_refused_pointing_to_remove(tmp_path, run_cli, ph
 
 
 def test_r7_4_source_on_a_drive_that_is_not_there_is_refused(tmp_path, run_cli):
+    taken = {drive[0].upper() for drive in os.listdrives()}
+    free = [letter for letter in "QRSTUVWXYZ" if letter not in taken]
+    if not free:
+        pytest.skip("every drive letter from Q to Z is in use")
+    camera = Path(f"{free[0]}:\\Cam")
     backup = tmp_path / "backup"
-    hand_written(backup, [("Cam", Path("Q:\\Cam"))])
-    refuses(run_cli, tmp_path, backup, "Q:\\Cam", expected=("doesn't exist",))
+    hand_written(backup, [("Cam", camera)])
+    refuses(run_cli, tmp_path, backup, camera, expected=("doesn't exist",))
 
 
 # R7.5: init's source checks, again
@@ -341,6 +357,15 @@ def test_r7_6_copy_or_plan_file_path_too_long_is_refused(tmp_path, run_cli, unit
     assert "shorter NAME=SOURCE" in err
 
 
+def test_r7_6_a_temporary_plan_file_path_too_long_is_refused(tmp_path, run_cli):
+    # NAME "P": the plan file's path is 249 units, its temporary file's 260 (I1, I6).
+    make_tree(tmp_path, {"src/P/a.txt": "a"})
+    backup = tmp_path / ("B" * (226 - len(str(tmp_path)) - 1))
+    hand_written(backup, [("P", tmp_path / "src" / "P")])
+    assert len(str(backup)) == 226
+    refuses(run_cli, tmp_path, backup, tmp_path / "src" / "P", expected=("260 characters",))
+
+
 # R7.7: NTFS only
 
 
@@ -357,6 +382,22 @@ def test_r7_7_backup_that_is_not_ntfs_is_refused(tmp_path, run_cli, photos, monk
             " which keep file dates exactly. Use an NTFS drive.",
         ),
     )
+
+
+def test_r7_7_a_drive_that_cannot_say_its_format_stops_the_run(
+    tmp_path, run_cli, photos, monkeypatch
+):
+    backup, source = photos
+
+    def not_ready(*args):
+        ctypes.set_last_error(21)
+        return 0
+
+    monkeypatch.setattr(space._kernel32, "GetVolumePathNameW", not_ready)
+    code, _, err = run_cli("plan", backup, source)
+    assert code == 1
+    assert f"{backup}: The device is not ready." in err
+    assert ".." not in err
 
 
 def test_r7_7_the_drive_format_comes_from_the_backup_folder(tmp_path):
@@ -726,6 +767,34 @@ def test_r5_2_space_to_copy_is_rounded_to_blocks_against_free_space(
     assert err == ""
 
 
+def test_r5_2_overwrites_count_in_the_space_to_copy(tmp_path, run_cli, copied, monkeypatch):
+    backup, source, _ = copied
+    put(source / "b.txt", b"y" * 5000, T2)
+    monkeypatch.setattr(space, "block_size", lambda folder: 4096)
+    monkeypatch.setattr(space, "disk_usage", lambda folder: (2**30, 0, 900 * 2**20))
+    out, _, plan = planned(run_cli, backup, source)
+    assert actions(plan) == [("overwrite", "b.txt")]
+    assert f"To copy: 8.0 KB. {backup.anchor} has 900 MB free." in out
+
+
+def test_r5_2_free_space_is_asked_before_the_plan_is_replaced(
+    tmp_path, run_cli, copied, monkeypatch
+):
+    # A drive that drops at that moment must not leave an unreviewed plan in place (I3).
+    backup, source, _ = copied
+    planned(run_cli, backup, source)
+    before = (backup / ".syncplan" / "plans" / "Photos.json").read_bytes()
+    put(source / "new.txt", "new")
+
+    def gone(folder):
+        raise OSError(21, "The device is not ready", str(folder))
+
+    monkeypatch.setattr(space, "disk_usage", gone)
+    code, _, _ = run_cli("plan", backup, source)
+    assert code == 1
+    assert (backup / ".syncplan" / "plans" / "Photos.json").read_bytes() == before
+
+
 def test_r5_3_a_drive_too_small_is_warned_about_and_the_plan_still_written(
     tmp_path, run_cli, first, monkeypatch
 ):
@@ -828,7 +897,13 @@ def test_r3_2_overwrite_turns_a_decision_into_an_overwrite_shown_as_chosen(
     assert [entry["path"] for entry in plan["chosen"]] == ["b.txt"]
     assert decided(plan) == [("a\\1.jpg", "backup copy newer")]
     assert "Overwriting, as you chose (the old copies go to the quarantine):" in out
-    assert "  b.txt  same date and size, different content" in out
+    lines = out.splitlines()
+    first = lines.index("  b.txt  same date and size, different content")
+    assert re.fullmatch(r"    source .+  3 bytes \| backup .+  3 bytes", lines[first + 1])
+    chosen = plan["chosen"][0]
+    assert plan_date(chosen["source"]["date"]) == T1
+    assert plan_date(chosen["backup"]["date"]) == T1
+    assert chosen["source"]["size"] == chosen["backup"]["size"] == 3
     assert "b.txt" not in err
 
 
@@ -922,6 +997,15 @@ def apply_plan(plan: dict, source: Path, copy: Path) -> None:
         os.utime(target, ns=(date, date))
 
 
+def plan_counting(backup: Path, source: Path) -> tuple[dict, int]:
+    """Run plan; return the plan file and the summary's unchanged count."""
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        assert cli.main(["plan", str(backup), str(source)]) == 0
+    found = re.search(r"^\s+unchanged\s+([\d,]+) files?$", out.getvalue(), re.M)
+    return read_plan(backup, "Photos"), int(found.group(1).replace(",", ""))
+
+
 @settings(max_examples=25, deadline=None)
 @given(mine=FILES, theirs=FILES)
 def test_property_a_plan_applied_leaves_nothing_to_do(mine, theirs):
@@ -933,20 +1017,37 @@ def test_property_a_plan_applied_leaves_nothing_to_do(mine, theirs):
             for name, (content, date) in files.items():
                 put(folder / name, content, date)
         assert cli.main(["init", str(backup), str(source)]) == 0
-        assert cli.main(["plan", str(backup), str(source)]) == 0
-        first = read_plan(backup, "Photos")
+        first, unchanged = plan_counting(backup, source)
 
-        acted = {a["path"] for a in first["actions"] if a["do"] != "make folder"}
+        # Each source file is counted once (D12), and sorted as R2 and R3.1 say.
+        files = {a["path"]: a for a in first["actions"] if a["do"] != "make folder"}
         decide = {entry["path"] for entry in first["decide"]}
-        assert not acted & decide
-        for name in mine.keys() - acted - decide:  # the rest are exact copies already
-            assert theirs.get(name) == mine[name]
+        assert not files.keys() & decide
+        assert unchanged + len(files) + len(decide) + len(first["skipped"]) == len(mine)
+        for name, (content, date) in mine.items():
+            other = theirs.get(name)
+            if name in decide:
+                assert other is not None and other[0] != content and date <= other[1]
+            elif name not in files:
+                assert other == (content, date)  # unchanged
+            elif files[name]["do"] == "copy":
+                assert other is None
+            elif files[name]["do"] == "overwrite":
+                assert other[0] != content and date > other[1]
+            else:
+                assert files[name]["do"] == "set date"
+                assert other[0] == content and date != other[1]
 
         apply_plan(first, source, backup / "Photos")
-        assert cli.main(["plan", str(backup), str(source)]) == 0
-        second = read_plan(backup, "Photos")
+        for name in mine.keys() - decide:  # an exact copy now: bytes and date
+            copied = backup / "Photos" / name
+            assert copied.read_bytes() == (source / name).read_bytes()
+            assert copied.stat().st_mtime_ns == (source / name).stat().st_mtime_ns
+
+        second, unchanged = plan_counting(backup, source)
         assert second["actions"] == []
         assert decided(second) == decided(first)
+        assert unchanged + len(second["decide"]) + len(second["skipped"]) == len(mine)
 
 
 # R6, R2.8, R2.9: what plan skips, and carries on
@@ -959,10 +1060,17 @@ def skipped(plan: dict) -> list[tuple[str, str]]:
 class Twisted:
     """A folder entry with some answers changed, for cases a test can't make for real."""
 
-    def __init__(self, entry, name: str | None = None, link: bool = False, attributes: int = 0):
+    def __init__(
+        self,
+        entry,
+        name: str | None = None,
+        link: bool = False,
+        attributes: int = 0,
+        reparse_tag: int | None = None,
+    ):
         self._entry, self.name = entry, name or entry.name
         self.path = str(Path(entry.path).with_name(self.name))
-        self._link, self._attributes = link, attributes
+        self._link, self._attributes, self._tag = link, attributes, reparse_tag
 
     def is_symlink(self) -> bool:
         return self._link or self._entry.is_symlink()
@@ -980,6 +1088,7 @@ class Twisted:
             st_size=info.st_size,
             st_mtime_ns=info.st_mtime_ns,
             st_file_attributes=info.st_file_attributes | self._attributes,
+            st_reparse_tag=info.st_reparse_tag if self._tag is None else self._tag,
         )
 
 
@@ -1061,19 +1170,21 @@ def gone_after(monkeypatch, root: Path) -> dict:
     return state
 
 
+@pytest.mark.parametrize("side", ["source", "copy"])
 def test_r1_3_a_drive_gone_while_listing_stops_the_run(
-    tmp_path, run_cli, copied, monkeypatch, failing_scandir
+    tmp_path, run_cli, copied, monkeypatch, failing_scandir, side
 ):
-    backup, source, _ = copied
-    state = gone_after(monkeypatch, source)
+    backup, source, copy = copied
+    top = source if side == "source" else copy
+    state = gone_after(monkeypatch, source if side == "source" else backup)
 
     def unplugged(path: Path) -> bool:
-        if path == source / "a":
+        if path == top / "a":
             state["gone"] = True
             return True
         return False
 
-    failing_scandir(unplugged, OSError(21, "The device is not ready", str(source / "a")))
+    failing_scandir(unplugged, OSError(21, "The device is not ready", str(top / "a")))
     code, _, err = run_cli("plan", backup, source)
     assert code == 1
     assert "The system cannot find the path specified" in err
@@ -1081,13 +1192,19 @@ def test_r1_3_a_drive_gone_while_listing_stops_the_run(
     assert not (backup / ".syncplan" / "plans").exists()
 
 
-def test_r1_3_a_drive_gone_while_reading_stops_the_run(tmp_path, run_cli, copied, monkeypatch):
-    backup, source, _ = copied
+@pytest.mark.parametrize("side", ["source", "copy"])
+def test_r1_3_a_drive_gone_while_reading_stops_the_run(
+    tmp_path, run_cli, copied, monkeypatch, side
+):
+    backup, source, copy = copied
     planned(run_cli, backup, source)
     before = (backup / ".syncplan" / "plans" / "Photos.json").read_bytes()
-    state = gone_after(monkeypatch, source)
+    state = gone_after(monkeypatch, source if side == "source" else backup)
+    real = compare._open_shared
 
     def unplugged(path):
+        if not Path(path).is_relative_to(source if side == "source" else copy):
+            return real(path)
         state["gone"] = True
         raise OSError(21, "The device is not ready", str(path))
 
@@ -1124,18 +1241,26 @@ def test_r3_3_overwrite_of_a_skipped_file_is_refused_with_the_reason(
     assert not (backup / ".syncplan" / "plans").exists()
 
 
-def test_r2_9_a_file_that_changes_while_read_is_skipped(tmp_path, run_cli, copied, monkeypatch):
-    backup, source, _ = copied
+@pytest.mark.parametrize("side", ["source", "copy"])
+@pytest.mark.parametrize("change", ["grows", "redated"])
+def test_r2_9_a_file_that_changes_while_read_is_skipped(
+    tmp_path, run_cli, copied, monkeypatch, side, change
+):
+    backup, source, copy = copied
+    changing = (source if side == "source" else copy) / "b.txt"
     real = compare._open_shared
 
-    def growing(path):
+    def changed(path):
         opened = real(path)
-        if Path(path) == source / "b.txt":
-            with (source / "b.txt").open("ab") as writer:  # another program writes
-                writer.write(b"more")
+        if Path(path) == changing:  # another program changes it while plan reads
+            if change == "grows":
+                with changing.open("ab") as writer:
+                    writer.write(b"more")
+            else:
+                os.utime(changing, ns=(T2, T2))
         return opened
 
-    monkeypatch.setattr(compare, "_open_shared", growing)
+    monkeypatch.setattr(compare, "_open_shared", changed)
     _, _, plan = planned(run_cli, backup, source)
     assert skipped(plan) == [("b.txt", "changed while planning; plan again")]
     assert plan["actions"] == []
@@ -1146,16 +1271,21 @@ def test_r5_5_progress_lines_come_every_10_seconds_also_inside_a_file(
 ):
     backup, source, copy = copied
     for folder in (source, copy):
-        put(folder / "big.bin", b"x" * 20)
-    clock = iter(range(0, 10_000, 10))
+        put(folder / "big.bin", b"x" * 100)
+    clock = iter(range(100_000))  # one second per look at the clock
     monkeypatch.setattr(compare, "monotonic", lambda: next(clock))
     monkeypatch.setattr(compare, "CHUNK", 4)
     out, _, _ = planned(run_cli, backup, source)
-    assert "Reading 3 files to compare (26 bytes)..." in out
+    assert "Reading 3 files to compare (106 bytes)..." in out
     progress = [line for line in out.splitlines() if " read (" in line]
-    assert any(line.endswith("(0 of 3 files)") for line in progress)  # inside the first file
-    assert progress[-1].endswith("(3 of 3 files)") or progress[-1].endswith("(2 of 3 files)")
-    assert all(line.startswith("  ") and " of 26 bytes read (" in line for line in progress)
+    assert 1 <= len(progress) <= 4  # every 10 s or so, not after every one of 27 chunks
+    figures = [
+        re.fullmatch(r"  (\d+) bytes of 106 bytes read \((\d) of 3 files\)", line)
+        for line in progress
+    ]
+    assert all(figures)
+    inside = [f for f in figures if f.group(2) == "2" and 6 < int(f.group(1)) < 106]
+    assert inside  # a line in the middle of big.bin, the third file read
 
 
 def test_r6_2_a_link_in_the_source_is_skipped_with_the_copy_below_it(
@@ -1191,7 +1321,7 @@ def test_r6_2_a_file_link_is_skipped_too(tmp_path, run_cli, copied, twisted, ope
     assert source / "b.txt" not in opened
 
 
-@pytest.mark.parametrize("name", ["a.", "b ", "CON"])
+@pytest.mark.parametrize("name", ["a.", "b ", "CON", "x\udc80.txt"])
 def test_r6_3_a_name_windows_cannot_normally_use_is_skipped(tmp_path, run_cli, copied, name):
     backup, source, _ = copied
     odd = extended(source / name)
@@ -1220,9 +1350,22 @@ def test_r6_3_names_differing_only_in_case_are_all_skipped(
     backup, source, copy = copied
     twisted(source, "b.txt", lambda entry: [entry, Twisted(entry, name="B.TXT")])
     _, _, plan = planned(run_cli, backup, source)
-    assert skipped(plan) == [("b.txt", "names that differ only in letter case")]
+    case = "names that differ only in letter case"
+    assert skipped(plan) == [("b.txt", case), ("B.TXT", case)]
     assert plan["actions"] == []
     assert copy / "b.txt" not in opened
+
+
+def test_r6_3_names_python_merges_but_windows_keeps_apart_are_skipped(tmp_path, run_cli, copied):
+    # A final sigma: lower() makes these one key, NTFS keeps two folders (I3).
+    backup, source, copy = copied
+    put(source / "ΦΩΤΟΓΡΑΦΙΕΣ" / "a.txt", "a")
+    put(copy / "φωτογραφιες" / "a.txt", "a")
+    assert not (copy / "ΦΩΤΟΓΡΑΦΙΕΣ").exists()
+    _, _, plan = planned(run_cli, backup, source)
+    case = "names that differ only in letter case"
+    assert sorted(skipped(plan)) == sorted([("ΦΩΤΟΓΡΑΦΙΕΣ", case), ("φωτογραφιες", case)])
+    assert plan["actions"] == []
 
 
 def long_backup(tmp_path: Path, run_cli, units: int) -> tuple[Path, Path]:
@@ -1290,6 +1433,14 @@ def test_r6_5_a_syncplan_backup_inside_is_skipped(tmp_path, run_cli, copied, sid
     assert plan["actions"] == []
 
 
+def test_r6_5_a_backup_only_in_the_copy_is_skipped_not_counted(tmp_path, run_cli, copied):
+    backup, source, copy = copied
+    hand_written(copy / "OldOnly", [("O", tmp_path / "o")])
+    out, _, plan = planned(run_cli, backup, source)
+    assert skipped(plan) == [("OldOnly", "a syncplan backup; backups aren't backed up")]
+    assert "no longer in" not in out
+
+
 @pytest.mark.parametrize("quick", [False, True])
 def test_r6_6_an_online_only_file_is_skipped_and_never_opened(
     tmp_path, run_cli, copied, opened, quick
@@ -1339,3 +1490,82 @@ def test_r4_2_and_r5_4_every_skipped_item_is_in_the_plan_file_and_the_log(
     assert "  ... and 5 more (all in the plan file)" in err
     log = (program_data / "syncplan" / "logs" / "syncplan.log").read_text("utf-8")
     assert "far\\54.txt  a date syncplan can't record" in log
+
+
+# Review fixes (implementation panel)
+
+
+def test_r2_4_files_larger_than_a_chunk_are_compared_to_the_end(
+    tmp_path, run_cli, copied, monkeypatch
+):
+    backup, source, copy = copied
+    monkeypatch.setattr(compare, "CHUNK", 4)
+    put(source / "later.bin", b"abcdefghijkl", T2)
+    put(copy / "later.bin", b"abcdefghijkX", T1)
+    put(source / "same.bin", b"abcdefghijkl", T1)
+    put(copy / "same.bin", b"abcdefghijkX", T1)
+    _, _, plan = planned(run_cli, backup, source)
+    assert actions(plan) == [("overwrite", "later.bin")]
+    assert decided(plan) == [("same.bin", "same date and size, different content")]
+
+
+def test_r1_2_a_plan_that_reads_still_changes_nothing(tmp_path, run_cli, copied, monkeypatch):
+    backup, source, copy = copied
+    os.utime(copy / "a" / "1.jpg", ns=(T0 - 1_000, T0 - 1_000))  # set date
+    put(source / "b.txt", "BEE", T2)  # overwrite, read
+    put(source / "c.txt", "sea")
+    put(copy / "c.txt", "SEA")  # a decision
+    put(source / "d.txt", "dee")
+    put(copy / "d.txt", "dee")  # the backup's copy can't be read
+    real = compare._open_shared
+
+    def damaged(path):
+        if Path(path) == copy / "d.txt":
+            raise OSError(22, "Data error (cyclic redundancy check)", str(path), 23)
+        return real(path)
+
+    monkeypatch.setattr(compare, "_open_shared", damaged)
+    before = tree_snapshot(tmp_path), file_dates(tmp_path)
+    _, _, plan = planned(run_cli, backup, source)
+    assert {action["do"] for action in plan["actions"]} == {"set date", "overwrite"}
+    assert len(plan["decide"]) == 2
+    plans = "backup/.syncplan/plans"
+    own = {"backup/.syncplan"}
+    snapshot = {k: v for k, v in tree_snapshot(tmp_path).items() if not k.startswith(plans)}
+    assert snapshot == before[0]
+    dates = {k: v for k, v in file_dates(tmp_path).items() if k not in own}
+    assert {k: v for k, v in dates.items() if not k.startswith(plans)} == {
+        k: v for k, v in before[1].items() if k not in own
+    }
+
+
+def test_r6_2_a_link_windows_marks_as_another_name_is_skipped(
+    tmp_path, run_cli, copied, twisted, opened
+):
+    # A link made from WSL: neither is_symlink() nor is_junction() (I6).
+    backup, source, _ = copied
+    twisted(source, "b.txt", lambda entry: [Twisted(entry, reparse_tag=0xA000001D)])
+    _, _, plan = planned(run_cli, backup, source)
+    assert skipped(plan) == [("b.txt", "a link; links aren't followed")]
+    assert source / "b.txt" not in opened
+
+
+def test_r3_3_overwrite_named_through_a_link_is_refused_with_the_reason(
+    tmp_path, run_cli, copied, junction
+):
+    backup, source, copy = copied
+    put(source / "2024" / "beach.jpg", "a")
+    put(copy / "2024" / "beach.jpg", "A")  # needs a decision
+    junction(source / "Album", source / "2024")
+    code, _, err = run_cli("plan", backup, source, "--overwrite", source / "Album" / "beach.jpg")
+    assert code == 1
+    assert "was skipped: a link; links aren't followed" in err
+
+
+def test_r4_2_the_plan_file_records_the_source_as_the_marker_spells_it(tmp_path, run_cli):
+    make_tree(tmp_path, {"src/Photos/a.txt": "a", "backup": None})
+    backup, spelled = tmp_path / "backup", tmp_path / "src" / "photos"
+    hand_written(backup, [("Photos", spelled)])
+    out, _, plan = planned(run_cli, backup, tmp_path / "src" / "Photos")
+    assert plan["source"] == str(spelled)
+    assert f"Plan for Photos ({spelled} -> " in out

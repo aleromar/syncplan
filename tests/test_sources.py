@@ -8,7 +8,14 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
-from conftest import lists_source, make_backup, make_tree, marker_names, tree_snapshot
+from conftest import (
+    hand_written,
+    lists_source,
+    make_backup,
+    make_tree,
+    marker_names,
+    tree_snapshot,
+)
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
@@ -41,22 +48,6 @@ def same_but_marker(before: dict, after: dict) -> bool:
     return {k: v for k, v in before.items() if k != key} == {
         k: v for k, v in after.items() if k != key
     }
-
-
-def hand_written(backup: Path, sources, waiting=()) -> Path:
-    """A marker written by hand, as before add and remove existed: (name, path) pairs."""
-    data = {
-        "syncplan_marker": 1,
-        "created": "2026-10-08T16:40:00+02:00",
-        "sources": [{"name": name, "path": str(path)} for name, path in sources],
-    }
-    if waiting:
-        data["to_quarantine"] = [
-            {"name": name, "path": str(path), "removed": "2026-10-12T10:15:00+02:00"}
-            for name, path in waiting
-        ]
-    make_tree(backup, {MARKER: json.dumps(data)})
-    return marker_file(backup)
 
 
 def full_disk(fd):

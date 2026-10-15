@@ -4,7 +4,6 @@ Everything is checked before anything is read. Nothing is written but the plan f
 replaces the previous plan for that source in one step (plan-copies D8).
 """
 
-import dataclasses
 import json
 import logging
 import stat
@@ -15,13 +14,16 @@ from pathlib import Path
 
 from syncplan import space
 from syncplan.checks import (
+    FOLDER_LIMIT,
     PATH_LIMIT,
     Refusal,
     backup_folder,
+    check_not_inside_backup,
     check_source,
     checked_marker,
     plain_folder,
     quoted,
+    reason,
     resolve,
     source_lines,
     too_long,
@@ -32,8 +34,9 @@ from syncplan.space import format_size, rounded
 
 logger = logging.getLogger(__name__)
 FORMAT = 1
-FOLDER_LIMIT = 248  # Windows can't make a folder whose path is this long (SP4)
 SHOWN = 50  # items per list on screen; the plan file has them all (R5.4)
+_TEMPORARY = "plan-XXXXXXXX.tmp"  # as long as the name write_through_temp gives its file
+_KINDS = ("copy", "overwrite", "set date", "make folder")
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _NS = 1_000_000_000
 
@@ -41,7 +44,8 @@ _NS = 1_000_000_000
 @dataclass(frozen=True)
 class Target:
     backup: Path
-    source: Source  # the name it is listed under, and its folder, resolved
+    source: Source  # as the marker lists it: its spelling goes into the plan (R4.2)
+    drive: str  # the root of the backup's volume, for the space line (D9)
     overwrite: dict[str, Path]  # the --overwrite files, by key (R3.3)
 
     @property
@@ -50,46 +54,50 @@ class Target:
 
     @property
     def plan_file(self) -> Path:
-        return self.backup / MARKER_DIR / "plans" / f"{self.source.name}.json"
+        return _plan_file(self.backup, self.source.name)
 
 
 def check_plan(backup: str, source: str, overwrite: Sequence[str]) -> Target:
     """Steps 1-6: refuse anything unsafe before anything is read (R7, R3.3)."""
     backup_dir = backup_folder(backup, "plan")
+    check_not_inside_backup(backup_dir)  # R7.1, before the marker is read
     current = checked_marker(backup_dir)
-    for parent in backup_dir.parents:  # R7.1, as init-marker R2.4
-        if has_marker(parent):
-            raise Refusal(f"{backup_dir} is inside the syncplan backup {parent}.")
     path = resolve(source, "plan")
     listed = next((s for s in current.sources if s.path == path), None)
     if listed is None:
         heading = f"{backup_dir} is not a backup of {path}. Its sources:"
         raise Refusal("\n".join([heading, *source_lines(current.sources)]))
-    target = Target(backup_dir, Source(listed.name, path), {})
-    _check_there(target)
+    _check_there(backup_dir, listed)
     check_source(path, backup_dir, "plan")
     logger.debug("source %s: listed as %s, there, apart from the backup", path, listed.name)
-    _check_copy(target)
-    plans = target.plan_file.parent
-    plain_folder(plans, backup_dir, "plan", "so syncplan can't write its plan there")
-    root, kind = space.filesystem(backup_dir)
+    _check_copy(backup_dir, listed)
+    _check_plans(_plan_file(backup_dir, listed.name).parent)
+    drive, kind = space.filesystem(backup_dir)
     if kind.upper() != "NTFS":
         raise Refusal(
-            f"{root} is formatted as {kind}. syncplan backs up only to NTFS drives,"
+            f"{drive} is formatted as {kind}. syncplan backs up only to NTFS drives,"
             " which keep file dates exactly. Use an NTFS drive."
         )
     chosen = {}
     for text in overwrite:
-        chosen_path = _chosen(text, path)
-        chosen[key(str(chosen_path.relative_to(path)))] = chosen_path
-    return dataclasses.replace(target, overwrite=chosen)
+        chosen_path = _chosen(text, listed.path)
+        chosen[key(str(chosen_path.relative_to(listed.path)))] = chosen_path
+    return Target(backup_dir, listed, drive, chosen)
 
 
 def finish_plan(target: Target, quick: bool) -> None:
     """Steps 7-11: compare, write the plan file, then report (R1.1, R4, R5)."""
     result = compare(target.source.path, target.copy, quick, target.overwrite)
+    needed, free = _space(target, result)  # asked before the swap: nothing fails after it
     _write(target, _plan_text(target, quick, result))
-    _report(target, quick, result)
+    _report(target, quick, result, needed, free)
+
+
+def _space(target: Target, result: Comparison) -> tuple[int, int]:
+    """R5.2: the space to copy, in whole blocks, and the backup drive's free space."""
+    block = space.block_size(target.backup)
+    copied = [a.source.size for a in result.actions if a.do in ("copy", "overwrite")]
+    return sum(rounded(size, block) for size in copied), space.disk_usage(target.backup)[2]
 
 
 def _write(target: Target, text: str) -> None:
@@ -103,8 +111,7 @@ def _write(target: Target, text: str) -> None:
             made = False
         write_through_temp(plans, text, lambda temp: temp.replace(target.plan_file), made, "plan-")
     except OSError as error:
-        reason = error.strerror or str(error)
-        raise Refusal(f"Couldn't write the plan in {plans}: {reason}.") from error
+        raise Refusal(f"Couldn't write the plan in {plans}: {reason(error)}") from error
     logger.debug("plan written: %s", target.plan_file)
 
 
@@ -165,8 +172,8 @@ def _json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-def _report(target: Target, quick: bool, result: Comparison) -> None:
-    """R5.1-R5.3: the counts, the space to copy, and where the plan is."""
+def _report(target: Target, quick: bool, result: Comparison, needed: int, free: int) -> None:
+    """R5.1-R5.4: the counts, the space to copy, the lists, and where the plan is."""
     logger.info("Plan for %s (%s -> %s):", target.source.name, target.source.path, target.copy)
     if quick:
         logger.info("Quick plan: sizes and dates only; damaged files can't be spotted.")
@@ -182,12 +189,9 @@ def _report(target: Target, quick: bool, result: Comparison) -> None:
     for label, count, unit, size in rows:
         units = unit if count == 1 else f"{unit}s"
         logger.info("%s", f"  {label:<12}{count:>{width},} {units:<7}  {size}".rstrip())
-    copied = [action.source.size for action in done["copy"] + done["overwrite"]]
-    block = space.block_size(target.backup)
-    needed = sum(rounded(size, block) for size in copied)
-    free = space.disk_usage(target.backup)[2]
-    drive = target.backup.anchor
-    logger.info("To copy: %s. %s has %s free.", format_size(needed), drive, format_size(free))
+    logger.info(
+        "To copy: %s. %s has %s free.", format_size(needed), target.drive, format_size(free)
+    )
     if needed > free:
         logger.warning(
             "Warning: about %s short. Apply will stop before copying unless you free space.",
@@ -219,9 +223,6 @@ def _report(target: Target, quick: bool, result: Comparison) -> None:
         logger.info("Nothing to do: %s is up to date.", target.copy)
     logger.info("Plan written to %s", target.plan_file)
     logger.info("Nothing has been changed.")
-
-
-_KINDS = ("copy", "overwrite", "set date", "make folder")
 
 
 def _listed(level: int, heading: str, items: list[list[str]]) -> None:
@@ -262,49 +263,72 @@ def _count(count: int, unit: str) -> str:
     return f"{count:,} {unit}" if count == 1 else f"{count:,} {unit}s"
 
 
-def _check_there(target: Target) -> None:
+def _plan_file(backup: Path, name: str) -> Path:
+    return backup / MARKER_DIR / "plans" / f"{name}.json"
+
+
+def _check_there(backup: Path, listed: Source) -> None:
     """R7.4: a listed source whose folder is gone is refused until deletions arrive (F4)."""
     try:
-        target.source.path.stat()
+        listed.path.stat()
     except FileNotFoundError, NotADirectoryError:
         raise Refusal(
-            f"{target.source.path} doesn't exist: it was deleted, or its drive is unplugged.\n"
+            f"{listed.path} doesn't exist: it was deleted, or its drive is unplugged.\n"
             "Plug the drive in, or stop backing it up with"
-            f" syncplan remove {quoted(str(target.backup))} {quoted(target.source.name)}."
+            f" syncplan remove {quoted(str(backup))} {quoted(listed.name)}."
         ) from None
 
 
-def _check_copy(target: Target) -> None:
+def _check_copy(backup: Path, listed: Source) -> None:
     """R7.6: the copy's folder is a plain folder or missing, not a backup, and short enough."""
-    copy = target.copy
+    copy = backup / listed.name
     shorter = (
-        f"Stop backing it up with syncplan remove {quoted(str(target.backup))}"
-        f" {quoted(target.source.name)}, then add it again with a shorter NAME=SOURCE."
+        f"Stop backing it up with syncplan remove {quoted(str(backup))}"
+        f" {quoted(listed.name)}, then add it again with a shorter NAME=SOURCE."
     )
     if too_long(copy, FOLDER_LIMIT):
         raise Refusal(
             f"{copy} would be a path of {FOLDER_LIMIT} characters or more,"
             f" too long for Windows. {shorter}"
         )
-    if too_long(target.plan_file):
+    plan_file = _plan_file(backup, listed.name)
+    longest = max(plan_file, plan_file.with_name(_TEMPORARY), key=lambda path: len(str(path)))
+    if too_long(longest):
         raise Refusal(
-            f"The plan for {target.source.name} would be {target.plan_file}, a path of"
-            f" {PATH_LIMIT} characters or more, too long for Windows. {shorter}"
+            f"The plan for {listed.name} would need a path of {PATH_LIMIT} characters or more"
+            f" ({longest}), too long for Windows. {shorter}"
         )
     why = "so syncplan can't plan copies into it"
-    if plain_folder(copy, target.backup, "plan", why) and has_marker(copy):
+    if plain_folder(copy, backup, "plan", why) and has_marker(copy):
         raise Refusal(
             f"{copy} is a syncplan backup itself, {why}."
-            f" Move it out of {target.backup}, then run plan again."
+            f" Move it out of {backup}, then run plan again."
         )
     logger.debug("copy %s: ok", copy)
 
 
-def _chosen(text: str, source: Path) -> Path:
-    """R3.3, before anything is read: an --overwrite FILE must be a plain file in the source."""
-    path = resolve(text, "plan")
+def _check_plans(plans: Path) -> None:
+    """R7.1: the plans folder is a real folder, or not there yet."""
     try:
-        info = path.lstat()
+        info = plans.lstat()
+    except FileNotFoundError:
+        return
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    ):
+        raise Refusal(f"{plans} is not a real folder. Remove it, then run plan again.")
+
+
+def _chosen(text: str, source: Path) -> Path:
+    """R3.3, before anything is read: an --overwrite FILE must be a plain file in the source.
+
+    The path is kept as typed, not resolved: a FILE named through a link must meet that
+    link's skip (R6.2) rather than quietly become the link's target.
+    """
+    path = None if text.startswith(("\\\\", "//")) else Path(text).absolute()
+    try:
+        info = None if path is None else path.lstat()
     except OSError:
         info = None
     plain = (
@@ -313,5 +337,5 @@ def _chosen(text: str, source: Path) -> Path:
         and not info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
     )
     if not plain or not path.is_relative_to(source):
-        raise Refusal(f"{path} isn't a file in {source}.")
+        raise Refusal(f"{path or text} isn't a file in {source}.")
     return path

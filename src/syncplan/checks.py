@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 _FORBIDDEN = frozenset('\\/:*?"<>|')
 _MAX_NAME = 255  # UTF-16 units, as Windows counts them
 PATH_LIMIT = 260  # Windows' path limit while long paths are off (manage-sources SP6)
+FOLDER_LIMIT = 248  # Windows can't make a folder whose path is this long (plan-copies SP4)
 
 
 class Refusal(Exception):
@@ -66,6 +67,13 @@ def backup_folder(text: str, command: str) -> Path:
     if own.is_symlink() or own.is_junction() or (own.exists() and not own.is_dir()):
         raise Refusal(f"{own} is not a real folder. Remove it, or choose another backup folder.")
     return backup_dir
+
+
+def check_not_inside_backup(backup_dir: Path) -> None:
+    """init-marker R2.4, plan-copies R7.1: no folder above the backup may be a backup."""
+    for parent in backup_dir.parents:
+        if has_marker(parent):
+            raise Refusal(f"{backup_dir} is inside the syncplan backup {parent}.")
 
 
 def checked_marker(backup_dir: Path) -> Marker:
@@ -172,8 +180,8 @@ def check_name(name: str) -> None:
         raise Refusal(f'"{name}" has a character that isn\'t valid text.')
     if name.lower() == MARKER_DIR:
         raise Refusal(f'"{name}" is reserved for syncplan\'s own files.')
-    too_long = len(name.encode("utf-16-le")) // 2 > _MAX_NAME
-    invalid = name in ("", ".", "..") or too_long or not _FORBIDDEN.isdisjoint(name)
+    name_too_long = len(name.encode("utf-16-le")) // 2 > _MAX_NAME
+    invalid = name in ("", ".", "..") or name_too_long or not _FORBIDDEN.isdisjoint(name)
     if invalid or os.path.isreserved(name):  # device names, trailing dot/space, control chars
         raise Refusal(f'"{name}" can\'t be a folder name on Windows.')
 
@@ -210,6 +218,12 @@ def broken(text: str) -> bool:
     except UnicodeEncodeError:
         return True
     return False
+
+
+def reason(error: OSError) -> str:
+    """Windows' words for an error, ending with one full stop."""
+    text = error.strerror or str(error)
+    return text if text.endswith(".") else f"{text}."
 
 
 def quoted(text: str) -> str:

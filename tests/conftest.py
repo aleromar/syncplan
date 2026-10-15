@@ -85,6 +85,22 @@ def tree_snapshot(root: Path) -> dict[str, object]:
     return snapshot
 
 
+def hand_written(backup: Path, sources, waiting=()) -> Path:
+    """A marker written by hand, (name, path) pairs taken as they are. Returns its path."""
+    data = {
+        "syncplan_marker": 1,
+        "created": "2026-10-08T16:40:00+02:00",
+        "sources": [{"name": name, "path": str(path)} for name, path in sources],
+    }
+    if waiting:
+        data["to_quarantine"] = [
+            {"name": name, "path": str(path), "removed": "2026-10-12T10:15:00+02:00"}
+            for name, path in waiting
+        ]
+    make_tree(backup, {".syncplan/marker.json": json.dumps(data)})
+    return backup / ".syncplan" / "marker.json"
+
+
 def file_dates(root: Path) -> dict[str, int]:
     """The modification date, in ns, of every file, folder and link under root.
 

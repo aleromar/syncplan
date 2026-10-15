@@ -53,7 +53,9 @@ def filesystem(folder: Path) -> tuple[str, str]:
     if not _kernel32.GetVolumePathNameW(str(folder), root, _BUFFER) or not (
         _kernel32.GetVolumeInformationW(root.value, None, 0, None, None, None, kind, _BUFFER)
     ):
-        raise ctypes.WinError(ctypes.get_last_error())
+        error = ctypes.WinError(ctypes.get_last_error())
+        error.strerror, error.filename = error.strerror.rstrip("."), str(folder)  # as os does
+        raise error
     logger.debug("drive %s: formatted as %s", root.value, kind.value)
     return root.value, kind.value
 

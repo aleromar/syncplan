@@ -8,7 +8,14 @@ import logging
 from collections.abc import Sequence
 from pathlib import Path
 
-from syncplan.checks import Refusal, Setup, backup_folder, check_sources, source_lines
+from syncplan.checks import (
+    Refusal,
+    Setup,
+    backup_folder,
+    check_not_inside_backup,
+    check_sources,
+    source_lines,
+)
 from syncplan.marker import (
     MARKER_DIR,
     Marker,
@@ -65,9 +72,7 @@ def _check_backup(backup_dir: Path) -> None:
         raise Refusal(str(error)) from error  # an OS error behind it gets Details (R5.2)
     else:
         raise Refusal(_already_a_backup(backup_dir, existing))
-    for parent in backup_dir.parents:
-        if has_marker(parent):
-            raise Refusal(f"{backup_dir} is inside the syncplan backup {parent}.")
+    check_not_inside_backup(backup_dir)
 
 
 def _already_a_backup(backup_dir: Path, existing: Marker) -> str:
