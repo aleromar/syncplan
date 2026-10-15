@@ -122,7 +122,7 @@ def _plan_text(target: Target, quick: bool, result: Comparison) -> str:
         "actions": [_action_entry(action) for action in result.actions],
         "chosen": [_decision_entry(decision) for decision in result.chosen],
         "decide": [_decision_entry(decision) for decision in result.decide],
-        "skipped": [],
+        "skipped": [{"path": item.path, "reason": item.reason} for item in result.skipped],
     }
     parts = [f"  {_json(name)}: {_json(value)}" for name, value in fields.items()]
     for name, entries in lists.items():
@@ -203,6 +203,11 @@ def _report(target: Target, quick: bool, result: Comparison) -> None:
         "Needs your decision (nothing planned for these):",
         [_decision_lines(decision) for decision in result.decide],
     )
+    _listed(
+        logging.WARNING,
+        "Skipped (nothing planned for these):",
+        [[f"  {item.path}  {item.reason}"] for item in result.skipped],
+    )
     if result.extra_files or result.extra_folders:
         logger.info(
             "On the backup but no longer in %s: %s, %s (left as they are for now).",
@@ -210,7 +215,7 @@ def _report(target: Target, quick: bool, result: Comparison) -> None:
             _count(result.extra_files, "file"),
             _count(result.extra_folders, "folder"),
         )
-    if not (result.actions or result.decide):
+    if not (result.actions or result.decide or result.skipped):
         logger.info("Nothing to do: %s is up to date.", target.copy)
     logger.info("Plan written to %s", target.plan_file)
     logger.info("Nothing has been changed.")

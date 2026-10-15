@@ -11,19 +11,24 @@ import msvcrt
 import os
 from collections.abc import Mapping
 from ctypes import wintypes
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from time import monotonic
 
-from syncplan.checks import Refusal
+from syncplan.checks import PATH_LIMIT, Refusal, broken, too_long
+from syncplan.marker import MARKER_DIR, has_marker
 from syncplan.space import format_size
 
 logger = logging.getLogger(__name__)
 CHUNK = 1 << 20  # bytes read at a time from each file (D4)
+PROGRESS_EVERY = 10  # seconds between progress lines (R5.5)
+FOLDER_LIMIT = 248  # Windows can't make a folder whose path is this long (SP4)
 SAME_DATE = "same date, other size"  # the cases of R3.1 and R3.4
 DIFFERENT = "same date and size, different content"
 NEWER = "backup copy newer"
 UNREADABLE = "backup copy can't be read"
+_ONLINE_ONLY = 0x400000 | 0x1000  # "recall on data access" or "offline" (D6, SP6)
+_LATEST = 253_402_300_800 * 1_000_000_000  # 10000-01-01 in ns since 1970: past it, R6.7
 
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 _kernel32.CreateFileW.argtypes = [
@@ -70,11 +75,18 @@ class Decision:
     reason: str = ""  # Windows' reason, for an unreadable backup copy
 
 
+@dataclass(frozen=True)
+class Skipped:
+    path: str
+    reason: str
+
+
 @dataclass
 class Comparison:
     actions: list[Action] = field(default_factory=list)
     decide: list[Decision] = field(default_factory=list)
     chosen: list[Decision] = field(default_factory=list)  # turned into overwrites (R3.2)
+    skipped: list[Skipped] = field(default_factory=list)
     unchanged: int = 0
     extra_files: int = 0  # only in the copy (R2.7)
     extra_folders: int = 0
@@ -82,11 +94,12 @@ class Comparison:
 
 @dataclass(frozen=True)
 class _Entry:
-    """One name in a folder listing."""
+    """One name in a folder listing, and why plan can't handle it, if it can't (R6)."""
 
     name: str
     folder: bool
     seen: Seen
+    problem: str = ""
 
 
 @dataclass(frozen=True)
@@ -108,6 +121,32 @@ class _Unreadable(Exception):
         self.side, self.error = side, error
 
 
+class _Progress:
+    """R5.5: a line every PROGRESS_EVERY seconds, checked after every chunk (D4)."""
+
+    def __init__(self, files: int, size: int) -> None:
+        self.files, self.size = files, size
+        self.files_done = self.done = self.reading = 0
+        self.due = monotonic() + PROGRESS_EVERY
+
+    def read(self, count: int) -> None:
+        self.reading += count
+        if monotonic() >= self.due:
+            logger.info(
+                "  %s of %s read (%s of %s files)",
+                format_size(self.done + self.reading),
+                format_size(self.size),
+                f"{self.files_done:,}",
+                f"{self.files:,}",
+            )
+            self.due = monotonic() + PROGRESS_EVERY
+
+    def finished(self, pair: _Pair) -> None:
+        self.files_done += 1
+        self.done += pair.seen_source.size
+        self.reading = 0
+
+
 def key(path: str) -> str:
     """An entry's key: its path inside the source, lower-cased as Windows compares (NFR1)."""
     return path.lower()
@@ -118,11 +157,7 @@ def compare(source: Path, copy: Path, quick: bool, overwrite: Mapping[str, Path]
     walk = _Walk(source, copy, quick, overwrite)
     logger.info("Listing %s and %s...", source, copy)
     started = monotonic()
-    if _exists(copy):
-        walk.folder("", source, copy)
-    else:
-        walk.result.actions.append(Action("make folder", "."))
-        walk.folder("", source, None)
+    walk.top()
     logger.debug(
         "listed %s and %s: %d pairs to read, in %.2f s",
         source,
@@ -140,20 +175,40 @@ class _Walk:
         self.result = Comparison()
         self.pairs: list[_Pair] = []
 
-    def folder(self, rel: str, source: Path, backup: Path | None) -> None:
-        """One folder of the source and, if it has one, its counterpart in the copy."""
-        mine = _listing(source)
-        theirs = _listing(backup) if backup is not None else {}
+    def top(self) -> None:
+        """The two top folders. Neither may fail to list: that ends the run (R1.3, R1.4)."""
+        mine, _ = _listing(self.source, source_side=True)
+        if _exists(self.copy):
+            theirs, _ = _listing(self.copy, source_side=False)
+            self._entries("", self.source, self.copy, mine, theirs)
+        else:
+            self.result.actions.append(Action("make folder", "."))
+            self._entries("", self.source, None, mine, {})
+
+    def _entries(
+        self,
+        rel: str,
+        source: Path,
+        backup: Path | None,
+        mine: dict[str, _Entry],
+        theirs: dict[str, _Entry],
+    ) -> None:
+        """Sort every entry of one folder of the source and its counterpart in the copy."""
         for entry_key in sorted(mine.keys() | theirs.keys()):
             here, there = mine.get(entry_key), theirs.get(entry_key)
             path = _join(rel, (here or there).name)
-            if here is None:
-                self._extra(there, backup / there.name)
+            problem = (here and here.problem) or (there and there.problem)
+            if problem:
+                self._skip(path, problem)
+            elif here is None:
+                self._extra(path, backup / there.name, there)
+            elif there is not None and here.folder != there.folder:
+                where = "a folder here, a file" if here.folder else "a file here, a folder"
+                self._skip(path, f"{where} on the backup")  # R6.4
+            elif too_long(self.copy / path, FOLDER_LIMIT if here.folder else PATH_LIMIT):
+                self._skip(path, _too_long_reason(here))  # R6.3, the copy's side
             elif here.folder:
-                inner = None if there is None else backup / there.name
-                if inner is None:
-                    self.result.actions.append(Action("make folder", path))
-                self.folder(path, source / here.name, inner)
+                self._folder(path, source / here.name, there and backup / there.name)
             elif there is None:
                 self.result.actions.append(Action("copy", path, here.seen))
             elif here.seen.size != there.seen.size:
@@ -164,6 +219,46 @@ class _Walk:
                 pair = _Pair(path, source / here.name, backup / there.name, here.seen, there.seen)
                 self.pairs.append(pair)
 
+    def _folder(self, rel: str, source: Path, backup: Path | None) -> None:
+        """A folder of the source: list both sides, then make it if needed and go down."""
+        try:
+            mine, mine_backup = _listing(source, source_side=True)
+            theirs, theirs_backup = (
+                _listing(backup, source_side=False) if backup is not None else ({}, False)
+            )
+        except OSError as error:
+            self._reachable()  # a drive gone ends the run (R1.3)
+            self._skip(rel, f"can't be read: {_reason(error)}")  # R6.1
+            return
+        if mine_backup or theirs_backup:
+            self._skip(rel, "a syncplan backup; backups aren't backed up")  # R6.5
+            return
+        if backup is None:
+            self.result.actions.append(Action("make folder", rel))
+        self._entries(rel, source, backup, mine, theirs)
+
+    def _extra(self, rel: str, path: Path, entry: _Entry) -> None:
+        """R2.7: count what is only in the copy, folders with everything in them."""
+        if not entry.folder:
+            self.result.extra_files += 1
+            return
+        try:
+            inside, is_backup = _listing(path, source_side=False)
+        except OSError as error:
+            self._reachable()
+            self._skip(rel, f"can't be read: {_reason(error)}")
+            return
+        if is_backup:
+            self._skip(rel, "a syncplan backup; backups aren't backed up")
+            return
+        self.result.extra_folders += 1
+        for inner in inside.values():
+            inner_rel = _join(rel, inner.name)
+            if inner.problem:
+                self._skip(inner_rel, inner.problem)
+            else:
+                self._extra(inner_rel, path / inner.name, inner)
+
     def read_pairs(self) -> None:
         """Steps 8-9: read each pair once, byte for byte (R2.4, D4); --overwrite's first (D3)."""
         total = sum(pair.seen_source.size for pair in self.pairs)
@@ -171,13 +266,14 @@ class _Walk:
             count = f"{len(self.pairs):,}"
             logger.info("Reading %s files to compare (%s)...", count, format_size(total))
         started = monotonic()
+        progress = _Progress(len(self.pairs), total)
         chosen = [pair for pair in self.pairs if key(pair.path) in self.overwrite]
         for pair in chosen:
-            self._read(pair)
+            self._read(pair, progress)
         self._check_chosen()
         for pair in self.pairs:
             if key(pair.path) not in self.overwrite:
-                self._read(pair)
+                self._read(pair, progress)
         logger.debug(
             "read %d pairs (%s) in %.2f s",
             len(self.pairs),
@@ -185,17 +281,38 @@ class _Walk:
             monotonic() - started,
         )
 
-    def _read(self, pair: _Pair) -> None:
+    def _read(self, pair: _Pair, progress: _Progress) -> None:
         try:
-            same = _same_bytes(pair.source, pair.backup)
+            same = _same_bytes(pair.source, pair.backup, progress)
         except _Unreadable as unreadable:
-            if unreadable.side != "backup":
-                raise unreadable.error from None
-            reason = unreadable.error.strerror or str(unreadable.error)
-            decision = Decision(pair.path, UNREADABLE, pair.seen_source, pair.seen_backup, reason)
-            self._decide(decision)
+            self._reachable()
+            reason = _reason(unreadable.error)
+            if unreadable.side == "source":
+                self._skip(pair.path, f"the source's file can't be read: {reason}")  # R2.8
+            else:
+                decision = Decision(
+                    pair.path, UNREADABLE, pair.seen_source, pair.seen_backup, reason
+                )
+                self._decide(decision)  # R3.4
+            return
+        finally:
+            progress.finished(pair)
+        if self._changed(pair):
+            self._skip(pair.path, "changed while planning; plan again")  # R2.9
             return
         self._sort(pair.path, pair.seen_source, pair.seen_backup, same)
+
+    def _changed(self, pair: _Pair) -> bool:
+        """R2.9, D5: the size or date of either file differs from the listing now."""
+        for path, seen in ((pair.source, pair.seen_source), (pair.backup, pair.seen_backup)):
+            try:
+                info = path.stat()
+            except OSError:
+                self._reachable()
+                return True
+            if (info.st_size, info.st_mtime_ns) != (seen.size, seen.date):
+                return True
+        return False
 
     def _sort(self, path: str, source: Seen, backup: Seen, same: bool) -> None:
         """R2.3, R2.5, R3.1: what a file on both sides needs."""
@@ -224,36 +341,81 @@ class _Walk:
         """R3.3: every --overwrite file must be one this plan lists as needing a decision."""
         chosen = {key(decision.path) for decision in self.result.chosen}
         for entry_key, path in self.overwrite.items():
-            if entry_key not in chosen:
-                raise Refusal(
-                    f"{path} doesn't need a decision; --overwrite only takes files listed"
-                    ' under "Needs your decision".'
-                )
+            if entry_key in chosen:
+                continue
+            for item in self.result.skipped:
+                skipped_key = key(item.path)
+                if entry_key == skipped_key or entry_key.startswith(f"{skipped_key}\\"):
+                    raise Refusal(f"{path} was skipped: {item.reason}")
+            raise Refusal(
+                f"{path} doesn't need a decision; --overwrite only takes files listed"
+                ' under "Needs your decision".'
+            )
 
-    def _extra(self, entry: _Entry, path: Path) -> None:
-        """R2.7: count what is only in the copy, folders with everything in them."""
-        if not entry.folder:
-            self.result.extra_files += 1
-            return
-        self.result.extra_folders += 1
-        for inner in _listing(path).values():
-            self._extra(inner, path / inner.name)
+    def _skip(self, path: str, reason: str) -> None:
+        self.result.skipped.append(Skipped(path, reason))
+
+    def _reachable(self) -> None:
+        """R1.3: after a failure, make sure both drives are still there; if not, stop."""
+        self.source.stat()
+        self.copy.parent.stat()
 
 
-def _listing(folder: Path) -> dict[str, _Entry]:
-    """One folder's entries by key, with each file's size and date as listed (SP11)."""
+def _listing(folder: Path, source_side: bool) -> tuple[dict[str, _Entry], bool]:
+    """One folder's entries by key, as listed (SP11), and whether it is a syncplan backup."""
     entries: dict[str, _Entry] = {}
     with os.scandir(folder) as found:
         for item in found:
             info = item.stat(follow_symlinks=False)
-            is_folder = item.is_dir(follow_symlinks=False)
-            entries[key(item.name)] = _Entry(
-                item.name, is_folder, Seen(info.st_size, info.st_mtime_ns)
+            entry = _Entry(
+                item.name,
+                item.is_dir(follow_symlinks=False),
+                Seen(info.st_size, info.st_mtime_ns),
             )
-    return entries
+            entry = replace(entry, problem=_problem(item, info, entry, source_side))
+            entry_key = key(item.name)
+            if entry_key in entries:  # R6.3: two names differing only in letter case
+                entry = replace(entries[entry_key], problem="names that differ only in letter case")
+            entries[entry_key] = entry
+    own = entries.get(MARKER_DIR)
+    is_backup = own is not None and own.folder and not own.problem and has_marker(folder)
+    return entries, is_backup
 
 
-def _same_bytes(source: Path, backup: Path) -> bool:
+def _problem(item: os.DirEntry, info: os.stat_result, entry: _Entry, source_side: bool) -> str:
+    """Why plan can't handle this entry, or "" (R6.2, R6.3, R6.6, R6.7)."""
+    if item.is_symlink() or item.is_junction():
+        return "a link; links aren't followed"
+    if _odd(item.name):
+        return "a name Windows can't normally use"
+    if too_long(Path(item.path), FOLDER_LIMIT if entry.folder else PATH_LIMIT):
+        return _too_long_reason(entry)
+    if entry.folder:
+        return ""
+    if source_side and info.st_file_attributes & _ONLINE_ONLY:
+        return 'online-only (OneDrive); make it "Always keep on this device"'
+    if info.st_mtime_ns >= _LATEST:
+        return "a date syncplan can't record"
+    return ""
+
+
+def _odd(name: str) -> bool:
+    """R6.3: a name Windows can't normally use. A device name with an extension is fine (SP13)."""
+    return (
+        broken(name)
+        or name != name.rstrip(". ")
+        or any(ord(char) < 32 for char in name)
+        or ("." not in name and os.path.isreserved(name))
+    )
+
+
+def _too_long_reason(entry: _Entry) -> str:
+    if entry.folder:
+        return f"a folder path of {FOLDER_LIMIT} characters or more"
+    return f"path of {PATH_LIMIT} characters or more"
+
+
+def _same_bytes(source: Path, backup: Path, progress: _Progress) -> bool:
     """True if the two files hold the same bytes, read in chunks to the first difference.
 
     A failure is raised as _Unreadable, naming the side that failed (R2.8, R3.4).
@@ -271,6 +433,7 @@ def _same_bytes(source: Path, backup: Path) -> bool:
                         return False
                     if not chunk:
                         return True
+                    progress.read(len(chunk))
     except OSError as error:
         raise _Unreadable(side, error) from error
 
@@ -295,6 +458,12 @@ def _exists(copy: Path) -> bool:
         copy.parent.stat()  # the backup drive itself gone? Then that error ends the run (R1.3)
         return False
     return True
+
+
+def _reason(error: OSError) -> str:
+    """Windows' words for an error, ending with a full stop."""
+    reason = error.strerror or str(error)
+    return reason if reason.endswith(".") else f"{reason}."
 
 
 def _join(rel: str, name: str) -> str:
