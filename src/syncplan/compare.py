@@ -48,7 +48,7 @@ _OPEN_EXISTING = 3
 _SEQUENTIAL_SCAN = 0x08000000
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Seen:
     """A file as the listing showed it: its size in bytes and its date in ns (SP3)."""
 
@@ -102,13 +102,14 @@ class _Entry:
     problem: str = ""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _Pair:
-    """Two files of the same size, to read and compare (R2.4)."""
+    """Two files of the same size, to read and compare (R2.4).
+
+    Only the path inside the source is kept: 100,000 pairs must fit in memory (NFR3).
+    """
 
     path: str
-    source: Path
-    backup: Path
     seen_source: Seen
     seen_backup: Seen
 
@@ -216,8 +217,7 @@ class _Walk:
             elif self.quick:
                 self._sort(path, here.seen, there.seen, same=here.seen.date == there.seen.date)
             else:
-                pair = _Pair(path, source / here.name, backup / there.name, here.seen, there.seen)
-                self.pairs.append(pair)
+                self.pairs.append(_Pair(path, here.seen, there.seen))
 
     def _folder(self, rel: str, source: Path, backup: Path | None) -> None:
         """A folder of the source: list both sides, then make it if needed and go down."""
@@ -283,7 +283,7 @@ class _Walk:
 
     def _read(self, pair: _Pair, progress: _Progress) -> None:
         try:
-            same = _same_bytes(pair.source, pair.backup, progress)
+            same = _same_bytes(self.source / pair.path, self.copy / pair.path, progress)
         except _Unreadable as unreadable:
             self._reachable()
             reason = _reason(unreadable.error)
@@ -304,7 +304,9 @@ class _Walk:
 
     def _changed(self, pair: _Pair) -> bool:
         """R2.9, D5: the size or date of either file differs from the listing now."""
-        for path, seen in ((pair.source, pair.seen_source), (pair.backup, pair.seen_backup)):
+        sides = ((self.source, pair.seen_source), (self.copy, pair.seen_backup))
+        for top, seen in sides:
+            path = top / pair.path
             try:
                 info = path.stat()
             except OSError:
